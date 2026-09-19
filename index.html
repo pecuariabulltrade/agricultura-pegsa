@@ -197,12 +197,13 @@ const CONFIG = {
 
 const APORTANTES = [
   { id: 'PEGSA', nombre: 'Pecuaria El Garabí' },
-  { id: 'GYV',   nombre: 'G&V' },
+  { id: 'GYV',   nombre: 'GVM (G&V Agro)' },
   { id: 'MERZ',  nombre: 'Merz' },
 ];
 const CULTIVOS = ['SOJA', 'MAIZ'];
 const CICLOS = ['PRIMERA', 'SEGUNDA'];
 const UNIDADES = ['lt', 'kg', 'g', 'bolsa', 'big bag', 'tn', 'un'];
+const CATEGORIAS = ['HERBICIDA', 'INSECTICIDA', 'FUNGICIDA', 'COADYUVANTE', 'REGULADOR DE CRECIMIENTO', 'SEMILLA', 'MICROGRANULADO', 'FERTILIZANTE', 'UREA', 'FERT. FOLIAR/ARRANCADOR', 'OTROS'];
 const TABLAS_CAMPANIA = ['campos','lotes','precios_mes','ordenes','labores','movimientos_stock','costos_varios','produccion','cosechas'];
 const TABLAS_GLOBAL = ['campanias','cotizaciones','insumos','contratistas','tipos_labor'];
 const TABLAS_HIJAS = { orden_lotes: 'ordenes', orden_insumos: 'ordenes' };
@@ -502,10 +503,10 @@ const Calc = {
     const campos = S.campos.map(c => {
       const lotes = Store.lotesDe(c.id), has = sum(lotes, l => l.has), qq = num(c.qq_ha) * has, qq_mes = qq / 12;
       const meses_c = precios.map(p => { const px = p.qq_usd || p.qq_usd_est || 0; return { mes: p.mes, qq: qq_mes, qq_usd: px, usd: qq_mes * px, estimado: !p.qq_usd }; });
-      const total = sum(meses_c, m => m.usd), estimados = meses_c.filter(m => m.estimado).length;
-      return { campo: c, has, qq_ha: num(c.qq_ha), qq_total: qq, meses: meses_c, total_usd: total, meses_estimados: estimados, usd_ha: has ? total / has : 0 };
+      const total = sum(meses_c, m => m.usd), estimados = meses_c.filter(m => m.estimado).length, devengado = sum(meses_c.filter(m => !m.estimado), m => m.usd);
+      return { campo: c, has, qq_ha: num(c.qq_ha), qq_total: qq, meses: meses_c, total_usd: total, devengado_usd: devengado, meses_estimados: estimados, usd_ha: has ? total / has : 0 };
     });
-    return { meses, precios, campos, total_usd: sum(campos, c => c.total_usd) };
+    return { meses, precios, campos, total_usd: sum(campos, c => c.total_usd), devengado_usd: sum(campos, c => c.devengado_usd), meses_devengados: precios.filter(p => p.qq_usd).length };
   },
 
   /* ---- costo de insumos por orden (con precio y aportante de la salida de stock) ---- */
@@ -521,15 +522,16 @@ const Calc = {
     return S.orden_insumos.filter(x => x.orden_id === ordenId).map(oi => {
       const cant = this.cantidadInsumo(oi, hasO);
       const sal = S.movimientos_stock.find(m => m.orden_insumo_id === oi.id);
-      const precio = sal && num(sal.precio_usd) > 0 ? num(sal.precio_usd) : null;
+      const rem = sal && sal.remito_mov_id ? S.movimientos_stock.find(m => m.id === sal.remito_mov_id) : null;
+      const precio = sal && num(sal.precio_usd) > 0 ? num(sal.precio_usd) : (rem && num(rem.precio_usd) > 0 ? num(rem.precio_usd) : null);
       const sug = precio === null ? this.precioSugerido(oi.insumo_id).precio : null;
       const px = precio ?? sug ?? 0;
-      return { oi, cantidad: cant, precio, precio_usado: px, estimado: precio === null, aportante: sal ? sal.aportante : null, usd: cant * px, salida: sal };
+      return { oi, cantidad: cant, precio, precio_usado: px, estimado: precio === null, aportante: sal ? (sal.aportante || (rem && rem.aportante) || null) : null, usd: cant * px, salida: sal };
     });
   },
 
   /* ---- costos por lote (todo en USD) ---- */
-  lotesCalc() {
+  lotesCalc(opts = {}) {
     const alq = this.alquiler();
     const precios = S.campania.precios || {};
     const lotes = S.lotes.map(l => {
@@ -540,7 +542,7 @@ const Calc = {
       const ap = (a, k, v) => { if (!v) return; r[k] += v; if (a) { r.aportes[a] = r.aportes[a] || { alquiler: 0, insumos: 0, labores: 0, varios: 0, cosecha: 0 }; r.aportes[a][k] += v; } else r.sin_asignar += v; };
       // alquiler
       const ac = alq.campos.find(x => x.campo.id === campo.id);
-      if (ac && ac.has) ap(campo.aportante_alquiler, 'alquiler', ac.total_usd * r.has / ac.has);
+      if (ac && ac.has) ap(campo.aportante_alquiler, 'alquiler', (opts.alquilerDevengado ? ac.devengado_usd : ac.total_usd) * r.has / ac.has);
       // producción y venta
       const px = precios[l.cultivo] || {};
       S.produccion.filter(p => p.lote_id === l.id).forEach(p => {
@@ -601,7 +603,8 @@ const Calc = {
   },
   /* ---- participación ---- */
   participacion() {
-    const lotes = this.lotesCalc();
+    // alquiler DEVENGADO: sólo los meses con cotización cargada (lo aportado hasta hoy), no el año completo estimado
+    const lotes = this.lotesCalc({ alquilerDevengado: true });
     const part = lotes.filter(r => r.participa), nopart = lotes.filter(r => !r.participa);
     const rubros = ['alquiler', 'insumos', 'labores', 'varios'];
     const porAp = {}; APORTANTES.forEach(a => porAp[a.id] = { alquiler: 0, insumos: 0, labores: 0, varios: 0, cosecha: 0, total: 0 });
@@ -624,7 +627,12 @@ const Calc = {
     const cosechaFilas = filas.map(f => ({ aportante: f.aportante, pagado: porAp[f.aportante].cosecha, corresponde: cosechaTotal * f.pct, dif: porAp[f.aportante].cosecha - cosechaTotal * f.pct }));
     // distribución del cereal según participación
     const kgPorCultivo = {}; CULTIVOS.forEach(c => kgPorCultivo[c] = sum(part.filter(r => r.cultivo === c), r => r.kg));
-    return { filas, total, sinAsignar, deudas, cosechaTotal, cosechaFilas, kgPorCultivo, nopart, part };
+    // aportes por categoría (insumos por categoría del catálogo; labores por tipo de OT; alquiler; varios)
+    const cat = {}; const add = (k, a, v) => { if (!v) return; cat[k] = cat[k] || {}; cat[k][a || 'SIN ASIGNAR'] = (cat[k][a || 'SIN ASIGNAR'] || 0) + v; };
+    part.forEach(r => { Object.entries(r.aportes).forEach(([a, v]) => { add('ALQUILER', a, v.alquiler); add('COSTOS VARIOS', a, v.varios); }); if (r.sin_asignar) {} r.insumos_det.forEach(d => add((d.insumo || {}).categoria || 'INSUMOS S/CAT.', d.aportante, d.usd)); });
+    S.labores.forEach(lb => { const ol = S.orden_lotes.find(x => x.id === lb.orden_lote_id); const l = ol && Store.lote(ol.lote_id); const c = l && Store.campo(l.campo_id); if (!l || !c || !c.participa || !l.participa) return; const o = Store.orden(lb.orden_id) || {}; add('LABOR ' + (o.tipo_labor || ''), lb.aportante, num(lb.monto_usd)); });
+    const categorias = Object.entries(cat).map(([k, v]) => ({ categoria: k, ...v, total: sum(Object.values(v)) })).sort((a, b) => b.total - a.total);
+    return { filas, total, sinAsignar, deudas, cosechaTotal, cosechaFilas, kgPorCultivo, nopart, part, categorias };
   },
 };
 </script>
@@ -880,9 +888,9 @@ Tabs.ordenes = {
   tipoChange(sel) { if (sel.value === '__nuevo') { const n = prompt('Nombre del nuevo tipo de labor:'); if (n) { UI.run(async () => { const t = await DB.insert('tipos_labor', { nombre: n.trim().toUpperCase() }); S.tipos_labor.push(t); this.draft.tipo_labor = t.nombre; this.renderForm(); }); } else { sel.value = this.draft.tipo_labor; } } else this.draft.tipo_labor = sel.value; },
   nuevoInsumo(nombre) {
     return new Promise(res => {
-      UI.modal(`<h3>Nuevo insumo</h3><div class="row"><div class="w2"><label class="f">Nombre</label><input id="ni-nombre" value="${esc(nombre.toUpperCase())}"></div><div><label class="f">Unidad</label><select id="ni-unidad">${opts(UNIDADES, 'lt')}</select></div></div>
+      UI.modal(`<h3>Nuevo insumo</h3><div class="row"><div class="w2"><label class="f">Nombre</label><input id="ni-nombre" value="${esc(nombre.toUpperCase())}"></div><div><label class="f">Unidad</label><select id="ni-unidad">${opts(UNIDADES, 'lt')}</select></div><div><label class="f">Categoría</label><select id="ni-cat">${opts(CATEGORIAS, 'HERBICIDA')}</select></div></div>
         <div class="foot"><button class="btn" onclick="UI.closeModal()">Cancelar</button><button class="btn primary" id="ni-ok">Agregar</button></div>`, () => {
-        document.getElementById('ni-ok').onclick = async () => { const n = UI.val('ni-nombre').trim().toUpperCase(); if (!n) return; await UI.run(async () => { const i = await DB.insert('insumos', { nombre: n, unidad: UI.val('ni-unidad'), activo: true }); S.insumos.push(i); S.insumos.sort((a, b) => a.nombre.localeCompare(b.nombre)); UI.closeModal(); this.addIns(i); res(i); }, 'Insumo agregado'); };
+        document.getElementById('ni-ok').onclick = async () => { const n = UI.val('ni-nombre').trim().toUpperCase(); if (!n) return; await UI.run(async () => { const i = await DB.insert('insumos', { nombre: n, unidad: UI.val('ni-unidad'), categoria: UI.val('ni-cat'), activo: true }); S.insumos.push(i); S.insumos.sort((a, b) => a.nombre.localeCompare(b.nombre)); UI.closeModal(); this.addIns(i); res(i); }, 'Insumo agregado'); };
       });
     });
   },
@@ -944,13 +952,14 @@ Tabs.ordenes = {
     box.innerHTML = `<h2>Órdenes generadas <span class="muted small">${list.length}</span><span class="spacer"></span>
       <select style="width:auto" onchange="Tabs.ordenes.filtro.campo=this.value;Tabs.ordenes.renderList()">${opts(S.campos, f.campo, c => c.nombre, c => c.id, 'Todos los campos')}</select>
       <input type="text" style="width:200px" placeholder="buscar…" value="${esc(f.texto)}" oninput="Tabs.ordenes.filtro.texto=this.value;Tabs.ordenes.renderList()"></h2>
-      <div class="tablewrap"><table class="t"><thead><tr><th>N°</th><th>Fecha</th><th>Tipo</th><th>Campos · lotes</th><th class="num">Has</th><th>Aplicador</th><th>Insumos</th><th>Estado</th><th></th></tr></thead><tbody>
+      <div class="tablewrap"><table class="t"><thead><tr><th>N°</th><th>Fecha</th><th>Tipo</th><th>Campos · lotes</th><th class="num">Has</th><th>Aplicador</th><th>Insumos</th><th class="num">Costo USD</th><th>Estado</th><th></th></tr></thead><tbody>
       ${list.map(o => { const ols = S.orden_lotes.filter(x => x.orden_id === o.id), ois = S.orden_insumos.filter(x => x.orden_id === o.id); const labs = S.labores.filter(l => l.orden_id === o.id); const fact = labs.length && labs.every(l => l.factura); const pend = S.movimientos_stock.filter(m => m.orden_id === o.id && !m.facturado).length;
         const campos = [...new Set(ols.map(ol => (Store.campo((Store.lote(ol.lote_id) || {}).campo_id) || {}).nombre))].join(', ');
         return `<tr><td><b>${o.numero}</b></td><td class="nowrap">${fdate(o.fecha)}</td><td>${esc(o.tipo_labor)}</td><td><b>${esc(campos)}</b><div class="muted small">${ols.map(ol => 'L ' + esc((Store.lote(ol.lote_id) || {}).nombre) + ' (' + fmt(ol.has, 1) + ')').join(' · ')}</div></td><td class="num">${fmt(sum(ols, x => x.has), 1)}</td><td>${esc((Store.contratista(o.contratista_id) || {}).nombre || '—')}</td>
         <td class="small">${ois.map(oi => esc((Store.insumo(oi.insumo_id) || {}).nombre) + ' ' + fmt(oi.cantidad, 1) + ' ' + esc(oi.unidad || '')).join('<br>')}</td>
+        <td class="num">${(() => { const cs = Calc.costoInsumosOrden(o.id); const t = sum(cs, c => c.usd), lab = sum(labs, l => l.monto_usd); return t || lab ? `<b>${fmt(t + lab)}</b><div class="muted small">ins. ${fmt(t)}${cs.some(c => c.estimado) ? '*' : ''} · lab. ${fmt(lab)}</div>` : ''; })()}</td>
         <td>${fact ? '<span class="tag ok">facturada</span>' : '<span class="tag warn">labor s/facturar</span>'} ${pend ? `<span class="tag warn">${pend} insumo(s) s/precio</span>` : ''}</td>
-        <td class="actions"><button class="btn xs" onclick="PDF.orden('${o.id}')">PDF</button> <button class="btn xs" onclick="Tabs.ordenes.editar('${o.id}')">Editar</button> <button class="btn xs danger" onclick="Tabs.ordenes.eliminar('${o.id}')">✕</button></td></tr>`; }).join('') || '<tr><td colspan="9" class="muted">No hay órdenes.</td></tr>'}</tbody></table></div>`;
+        <td class="actions"><button class="btn xs" onclick="PDF.orden('${o.id}')">PDF</button> <button class="btn xs" onclick="Tabs.ordenes.editar('${o.id}')">Editar</button> <button class="btn xs danger" onclick="Tabs.ordenes.eliminar('${o.id}')">✕</button></td></tr>`; }).join('') || '<tr><td colspan="10" class="muted">No hay órdenes.</td></tr>'}</tbody></table></div><p class="muted small">* insumos valuados a precio sugerido (falta precio en Stock).</p>`;
   },
   editar(id) {
     const o = Store.orden(id); const ols = S.orden_lotes.filter(x => x.orden_id === id), ois = S.orden_insumos.filter(x => x.orden_id === id); const hasTot = sum(ols, x => x.has);
@@ -1357,12 +1366,14 @@ Tabs.participacion = {
   render(m) {
     const P = Calc.participacion(); const pact = S.campania.participacion_pactada || {};
     const ajustes = this.ajustes(P.filas);
-    m.innerHTML = `<div class="note info"><b>Participación antes de cosecha</b>: se suma lo que cada socio aportó (alquiler + insumos + labores + costos varios) en los lotes que entran en la sociedad, y se compara con lo pactado (${APORTANTES.map(a => a.id + ' ' + fmt(pact[a.id], 0) + ' %').join(' · ')}). Los campos que no entran en la sociedad se tratan aparte, más abajo.</div>
+    m.innerHTML = `<div class="note info"><b>Participación antes de cosecha</b>: se suma lo que cada socio aportó (alquiler + insumos + labores + costos varios) en los lotes que entran en la sociedad, y se compara con lo pactado (${APORTANTES.map(a => a.id + ' ' + fmt(pact[a.id], 0) + ' %').join(' · ')}). Los campos que no entran en la sociedad se tratan aparte, más abajo. El alquiler se computa <b>devengado</b>: sólo los meses con cotización cargada (${Calc.alquiler().meses_devengados} de 12).</div>
     <div class="kpis">${P.filas.map(f => `<div class="kpi"><div class="l">${esc(aportanteNombre(f.aportante))}</div><div class="v">${pct(f.pct)}</div><div class="s">${usd(f.total)} aportados · pactado ${pct(f.pct_pactada, 0)}</div><div class="bar" style="margin-top:6px"><i style="width:${Math.min(100, f.pct * 100)}%;background:var(--${f.aportante.toLowerCase()})"></i></div></div>`).join('')}<div class="kpi"><div class="l">Total aportado</div><div class="v">${usd(P.total)}</div><div class="s">${P.sinAsignar ? '<span class="neg">' + usd(P.sinAsignar) + ' sin aportante</span>' : 'todo asignado'}</div></div></div>
     <div class="card"><h2>Aportes por socio (lotes en sociedad)</h2><div class="tablewrap"><table class="t"><thead><tr><th>Socio</th><th class="num">Alquiler</th><th class="num">Insumos</th><th class="num">Labores</th><th class="num">Varios</th><th class="num">Total aportado</th><th class="num">% real</th><th class="num">% pactado</th><th class="num">Le corresponde</th><th class="num">Diferencia</th></tr></thead><tbody>
       ${P.filas.map(f => `<tr><td>${tagAp(f.aportante)} ${esc(aportanteNombre(f.aportante))}</td><td class="num">${fmt(f.alquiler)}</td><td class="num">${fmt(f.insumos)}</td><td class="num">${fmt(f.labores)}</td><td class="num">${fmt(f.varios)}</td><td class="num"><b>${fmt(f.total)}</b></td><td class="num"><b>${pct(f.pct)}</b></td><td class="num">${pct(f.pct_pactada, 0)}</td><td class="num">${fmt(P.total * f.pct_pactada)}</td><td class="num ${f.dif_usd > 0 ? 'pos' : f.dif_usd < 0 ? 'neg' : ''}">${f.dif_usd > 0 ? '+' : ''}${fmt(f.dif_usd)}</td></tr>`).join('')}</tbody>
       <tfoot><tr><td>Total</td><td class="num">${fmt(sum(P.filas, f => f.alquiler))}</td><td class="num">${fmt(sum(P.filas, f => f.insumos))}</td><td class="num">${fmt(sum(P.filas, f => f.labores))}</td><td class="num">${fmt(sum(P.filas, f => f.varios))}</td><td class="num">${fmt(P.total)}</td><td class="num">100 %</td><td class="num">100 %</td><td></td><td></td></tr></tfoot></table></div>
       ${ajustes.length ? `<h3 style="margin-top:12px">Para llegar a lo pactado</h3>${ajustes.map(a => `<div>• <b>${esc(a.de)}</b> debe a <b>${esc(a.a)}</b>: <b>${usd(a.usd)}</b> (aportó de más ${esc(a.a)} / de menos ${esc(a.de)})</div>`).join('')}` : '<p class="muted small" style="margin-top:8px">Los aportes coinciden con lo pactado.</p>'}</div>
+    <div class="card"><h2>Aportes por categoría</h2><div class="tablewrap"><table class="t compact"><thead><tr><th>Categoría</th>${APORTANTES.map(a => `<th class="num">${a.id}</th>`).join('')}<th class="num">Sin asignar</th><th class="num">Total</th><th class="num">%</th></tr></thead><tbody>
+      ${P.categorias.map(c => `<tr><td><b>${esc(c.categoria)}</b></td>${APORTANTES.map(a => `<td class="num">${c[a.id] ? fmt(c[a.id]) : ''}</td>`).join('')}<td class="num neg">${c['SIN ASIGNAR'] ? fmt(c['SIN ASIGNAR']) : ''}</td><td class="num"><b>${fmt(c.total)}</b></td><td class="num">${pct(P.total ? c.total / (P.total + P.sinAsignar) : null)}</td></tr>`).join('') || '<tr><td colspan="7" class="muted">Sin aportes.</td></tr>'}</tbody></table></div><p class="muted small">Insumos por categoría del catálogo (se asigna al crear el insumo o desde Stock), labores por tipo de orden. Sólo lotes en sociedad, sin cosecha.</p></div>
     <div class="grid2"><div class="card"><h2>Cosecha: costo a pagar según participación</h2><div class="tablewrap"><table class="t compact"><thead><tr><th>Socio</th><th class="num">% part.</th><th class="num">Le corresponde</th><th class="num">Pagó</th><th class="num">Diferencia</th></tr></thead><tbody>
       ${P.cosechaFilas.map(f => `<tr><td>${tagAp(f.aportante)}</td><td class="num">${pct(P.filas.find(x => x.aportante === f.aportante).pct)}</td><td class="num">${fmt(f.corresponde)}</td><td class="num">${fmt(f.pagado)}</td><td class="num ${f.dif > 0 ? 'pos' : f.dif < 0 ? 'neg' : ''}">${f.dif > 0 ? '+' : ''}${fmt(f.dif)}</td></tr>`).join('')}</tbody><tfoot><tr><td>Total cosecha</td><td></td><td class="num">${fmt(P.cosechaTotal)}</td><td class="num">${fmt(P.cosechaTotal)}</td><td></td></tr></tfoot></table></div></div>
       <div class="card"><h2>Cereal a retirar según participación</h2><div class="tablewrap"><table class="t compact"><thead><tr><th>Socio</th><th class="num">% part.</th>${CULTIVOS.map(c => `<th class="num">${c} kg</th>`).join('')}</tr></thead><tbody>
@@ -1391,7 +1402,7 @@ Tabs.dashboard = {
     this.charts.forEach(c => c.destroy()); this.charts = [];
     const L = Calc.lotesCalc(), part = L.filter(r => r.participa); const P = Calc.participacion(); const proy = S.campania.proyeccion || {};
     const tot = Calc.agrupar(part, () => 'T', () => 'T')[0] || { has: 0, alquiler: 0, insumos: 0, labores: 0, varios: 0, cosecha: 0, costo: 0, venta: 0, kg: 0 };
-    const pendStock = S.movimientos_stock.filter(x => x.tipo === 'salida' && !x.facturado).length, pendLab = S.labores.filter(l => !l.factura).length;
+    const pendStock = S.movimientos_stock.filter(x => x.tipo === 'salida' && !(num(x.precio_usd) > 0 || (x.remito_mov_id && num((S.movimientos_stock.find(r => r.id === x.remito_mov_id) || {}).precio_usd) > 0))).length, pendLab = S.labores.filter(l => !l.factura).length;
     const rubros = ['alquiler', 'insumos', 'labores', 'varios', 'cosecha'];
     // proyección por cultivo
     const cult = CULTIVOS.map(c => { const arr = part.filter(r => r.cultivo === c); const has = sum(arr, r => r.has); const p = proy[c] || {}; const real = {}; rubros.forEach(k => real[k] = has ? sum(arr, r => r[k]) / has : 0); const pr = {}; rubros.forEach(k => pr[k] = num(p[k])); const proyTot = rubros.reduce((s, k) => s + pr[k], 0), realTot = rubros.reduce((s, k) => s + real[k], 0);
@@ -1401,7 +1412,7 @@ Tabs.dashboard = {
       <div class="kpi"><div class="l">Costo acumulado</div><div class="v">${usd(tot.costo)}</div><div class="s">${usd(tot.costo_ha)}/ha</div></div>
       <div class="kpi"><div class="l">Proyectado (agrónomo)</div><div class="v">${usd(sum(cult, x => x.proyTot * x.has))}</div><div class="s">${sum(cult, x => x.proyTot * x.has) ? pct(tot.costo / sum(cult, x => x.proyTot * x.has)) + ' ejecutado' : 'sin proyección cargada'}</div></div>
       <div class="kpi"><div class="l">Órdenes de trabajo</div><div class="v">${S.ordenes.length}</div><div class="s">${pendLab ? '<span class="neg">' + pendLab + ' labores sin factura</span>' : 'todas facturadas'}</div></div>
-      <div class="kpi"><div class="l">Insumos sin precio</div><div class="v ${pendStock ? 'neg' : 'pos'}">${pendStock}</div><div class="s">pendientes en Stock</div></div>
+      <div class="kpi"><div class="l">Insumos sin precio</div><div class="v ${pendStock ? 'neg' : 'pos'}">${pendStock}</div><div class="s">salidas de OT sin precio (Stock → Movimientos)</div></div>
       ${P.filas.map(f => `<div class="kpi"><div class="l">Participación ${f.aportante}</div><div class="v">${pct(f.pct)}</div><div class="s">pactado ${pct(f.pct_pactada, 0)} · ${usd(f.total)}</div></div>`).join('')}
     </div>
     <div class="grid2">
