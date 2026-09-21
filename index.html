@@ -8,6 +8,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <style>
 :root{
   --bg:#f4f5f2;--card:#fff;--ink:#1d2a1f;--muted:#6b7570;--line:#dfe3dc;
@@ -170,6 +171,8 @@ details summary{cursor:pointer;font-weight:600;color:var(--muted);padding:4px 0}
   <div class="brand">🌱 Agricultura <span>PEGSA · G&V · Merz</span></div>
   <div class="grow"></div>
   <span id="modebadge">modo local</span>
+  <button class="btn sm" id="btn-refresh" onclick="App.refrescar()" title="Volver a leer los datos de la base (lo que cargaron los otros usuarios)">↻ Refrescar</button>
+  <button class="btn sm" onclick="Exportar.excel()" title="Descargar toda la información de la campaña en un Excel">⬇ Excel</button>
   <select id="sel-campania" onchange="App.setCampania(this.value)"></select>
   <button class="btn sm" onclick="Campanias.nueva()" title="Nueva campaña">+ Campaña</button>
   <button class="btn sm" onclick="Campanias.editar()" title="Configurar campaña">⚙</button>
@@ -428,6 +431,11 @@ const App = {
     const mod = Tabs[this.tab]; m.innerHTML = ''; mod.render(m);
   },
   refresh() { this.render(); },
+  async refrescar() {
+    const b = document.getElementById('btn-refresh'); if (b) { b.disabled = true; b.textContent = '↻ Actualizando…'; }
+    await UI.run(async () => { await Store.loadGlobal(); await Store.loadCampania(S.campania ? S.campania.id : null); this.renderCampanias(); this.render(); }, 'Datos actualizados desde la base');
+    if (b) { b.disabled = false; b.textContent = '↻ Refrescar'; }
+  },
 };
 const Tabs = {};
 
@@ -1499,5 +1507,71 @@ const Demo = {
 
 window.addEventListener('DOMContentLoaded', () => { document.getElementById('login-pass').addEventListener('keydown', e => { if (e.key === 'Enter') Auth.login(); }); App.boot(); });
 </script>
+
+<script>
+/* =====================================================================
+   EXPORTAR TODO A EXCEL (SheetJS)
+   ===================================================================== */
+const Exportar = {
+  async excel() {
+    if (!window.XLSX) return UI.toast('No se pudo cargar la librería de Excel. Revisá la conexión.', true);
+    UI.toast('Armando el Excel…');
+    const wb = XLSX.utils.book_new();
+    const add = (nombre, rows, cols) => { const ws = XLSX.utils.json_to_sheet(rows.length ? rows : [{ '(sin datos)': '' }]); if (cols) ws['!cols'] = cols.map(w => ({ wch: w })); XLSX.utils.book_append_sheet(wb, ws, nombre.slice(0, 31)); };
+    const r2 = v => v === null || v === undefined || v === '' ? '' : Math.round(num(v) * 100) / 100;
+    const cn = id => (Store.campo(id) || {}).nombre || '';
+    const inN = id => (Store.insumo(id) || {}).nombre || '';
+    const ctN = id => (Store.contratista(id) || {}).nombre || '';
+    const L = Calc.lotesCalc(); const P = Calc.participacion(); const A = Calc.alquiler();
+
+    // 1. Campos y lotes
+    add('CAMPOS', S.campos.map(c => ({ CAMPO: c.nombre, 'EN SOCIEDAD': c.participa ? 'SI' : 'NO', 'A CARGO DE': c.participa ? '' : c.dueno, 'QQ/HA ALQUILER': c.qq_ha, 'PAGA ALQUILER': c.aportante_alquiler, HAS: r2(sum(Store.lotesDe(c.id), l => l.has)), LOTES: Store.lotesDe(c.id).length, OBS: c.obs || '' })), [18, 12, 12, 14, 14, 10, 8, 50]);
+    add('LOTES', S.lotes.map(l => ({ CAMPO: cn(l.campo_id), LOTE: l.nombre, HAS: l.has, CULTIVO: l.cultivo, CICLO: l.ciclo, 'EN SOCIEDAD': l.participa && (Store.campo(l.campo_id) || {}).participa ? 'SI' : 'NO', OBS: l.obs || '' })), [18, 12, 8, 8, 10, 12, 40]);
+    // 2. Cotizaciones y alquiler
+    add('COTIZACIONES MES', A.precios.map(p => ({ MES: mesLabel(p.mes), 'SOJA $/TN': r2(p.soja_ars), 'TC DIVISA VTA': r2(p.dolar), 'USD/QQ': r2(p.qq_usd || p.qq_usd_est), ORIGEN: p.origen === 'manual' ? 'manual' : p.origen === 'auto' ? 'cotizaciones diarias' : 'ESTIMADO (sin dato)' })), [12, 14, 14, 10, 22]);
+    add('COTIZACIONES DIARIAS', S.cotizaciones.map(c => ({ FECHA: c.fecha, 'SOJA $/TN': c.soja_ars, 'DOLAR DIVISA VTA': c.dolar_venta, FUENTE: c.fuente || '' })), [12, 12, 16, 12]);
+    const alqRows = []; A.campos.forEach(c => c.meses.forEach(m => alqRows.push({ CAMPO: c.campo.nombre, MES: mesLabel(m.mes), 'SOCIO QUE APORTA': c.campo.aportante_alquiler, 'QQ DEL MES': r2(m.qq), 'USD/QQ': r2(m.qq_usd), 'APORTE USD': r2(m.usd), ESTADO: m.estimado ? 'ESTIMADO' : 'OK' })));
+    add('ALQUILERES', alqRows, [18, 12, 18, 12, 10, 12, 10]);
+    // 3. Órdenes de trabajo (una fila por OT · lote · insumo, como la planilla)
+    const otRows = [];
+    S.ordenes.slice().sort((a, b) => a.numero - b.numero).forEach(o => {
+      const ols = S.orden_lotes.filter(x => x.orden_id === o.id), ois = S.orden_insumos.filter(x => x.orden_id === o.id), hasT = sum(ols, x => x.has); const costos = Calc.costoInsumosOrden(o.id);
+      ols.forEach(ol => { const l = Store.lote(ol.lote_id) || {}; const f = hasT ? num(ol.has) / hasT : 0;
+        (ois.length ? ois : [null]).forEach(oi => { const c = oi ? costos.find(x => x.oi.id === oi.id) : null; const sal = oi ? S.movimientos_stock.find(m => m.orden_insumo_id === oi.id) : null;
+          otRows.push({ FECHA: o.fecha, 'NRO OT': o.numero, CAMPO: cn(l.campo_id), CULTIVO: l.cultivo || '', LOTE: l.nombre || '', 'TIPO DE OT': o.tipo_labor, RESPONSABLE: ctN(o.contratista_id), 'HAS': r2(ol.has), PRODUCTO: oi ? inN(oi.insumo_id) : '', 'DOSIS/HA': oi ? r2(oi.modo === 'ha' ? oi.dosis : (hasT ? oi.cantidad / hasT : 0)) : '', 'CANTIDAD (este lote)': oi ? r2(oi.cantidad * f) : '', 'CANTIDAD OT': oi ? r2(oi.cantidad) : '', UNIDAD: oi ? (oi.unidad || '') : '', 'NRO REMITO': sal ? (sal.remito || '') : '', 'PRECIO USD/UN': c ? r2(c.precio_usado) : '', 'COSTO USD (este lote)': c ? r2(c.usd * f) : '', 'PRECIO': c ? (c.estimado ? 'SUGERIDO / SIN PRECIO' : 'OK') : '', APORTANTE: c ? (c.aportante || 'SIN ASIGNAR') : '', 'OBS INSUMO': oi ? (oi.obs || '') : '', 'OBS LOTE': ol.obs || '', 'OBS OT': o.obs || '' });
+        }); });
+    });
+    add('OTS', otRows, [11, 7, 16, 8, 10, 22, 22, 8, 28, 9, 12, 11, 8, 11, 11, 14, 18, 12, 30, 20, 30]);
+    // 4. Labores
+    add('LABORES', S.labores.map(lb => { const ol = S.orden_lotes.find(x => x.id === lb.orden_lote_id) || {}; const o = Store.orden(lb.orden_id) || {}; const l = Store.lote(ol.lote_id) || {}; return { FECHA: lb.fecha || o.fecha || '', 'NRO OT': o.numero, CAMPO: cn(l.campo_id), CULTIVO: l.cultivo || '', LOTE: l.nombre || '', 'TIPO DE OT': o.tipo_labor || '', RESPONSABLE: ctN(lb.contratista_id), 'HAS OT': r2(ol.has), 'HAS REALES': r2(lb.has_reales), '$/HA': r2(lb.precio_ha_ars), TC: r2(lb.tc), 'MONTO USD': r2(lb.monto_usd), FACTURA: lb.factura || '', 'SOCIO QUE PAGA': lb.aportante || 'SIN ASIGNAR', OBS: lb.obs || '' }; }), [11, 7, 16, 8, 10, 22, 22, 8, 10, 10, 8, 11, 10, 14, 30]);
+    // 5. Stock
+    add('MOVIMIENTOS STOCK', S.movimientos_stock.slice().sort((a, b) => (a.fecha || '').localeCompare(b.fecha || '')).map(m => { const rm = m.remito_mov_id ? S.movimientos_stock.find(x => x.id === m.remito_mov_id) : null; const px = num(m.precio_usd) || (rm ? num(rm.precio_usd) : 0); return { FECHA: m.fecha || '', TIPO: m.tipo, 'NRO REMITO': m.remito || '', PROVEEDOR: m.proveedor || '', PRODUCTO: inN(m.insumo_id), CANTIDAD: r2(m.cantidad), UNIDAD: (Store.insumo(m.insumo_id) || {}).unidad || '', 'PRECIO USD/UN': px ? r2(px) : '', 'IMPORTE USD': px ? r2(Math.abs(m.cantidad) * px) : '', DEPOSITO: cn(m.campo_id), 'SOCIO QUE APORTA': m.aportante || (rm ? rm.aportante : '') || 'SIN ASIGNAR', 'NRO OT': m.orden_id ? (Store.orden(m.orden_id) || {}).numero : '', 'DESCUENTA DE REMITO': rm ? (rm.remito || '') : '', FACTURA: m.factura || '', ESTADO: m.tipo === 'salida' && !m.facturado ? 'PENDIENTE' : 'OK', OBS: m.obs || '' }; }), [11, 9, 11, 18, 28, 10, 8, 12, 12, 16, 16, 7, 16, 10, 10, 40]);
+    const ins = [...new Set(S.movimientos_stock.map(m => m.insumo_id))].map(id => Store.insumo(id)).filter(Boolean).sort((a, b) => a.nombre.localeCompare(b.nombre));
+    const stRows = []; ins.forEach(i => { S.campos.forEach(c => { const q = Calc.stockInsumo(i.id, c.id); if (Math.abs(q) > 1e-6) stRows.push({ DEPOSITO: c.nombre, PRODUCTO: i.nombre, CATEGORIA: i.categoria || '', STOCK: r2(q), UNIDAD: i.unidad, 'ULT. PRECIO USD': r2(Calc.precioSugerido(i.id).precio) }); }); });
+    add('STOCK ACTUAL', stRows, [16, 28, 16, 10, 8, 14]);
+    add('REMITOS ABIERTOS', Tabs.stock.remitosAbiertos().map(m => { const u = Tabs.stock.remitoUso(m); return { FECHA: m.fecha || '', 'NRO REMITO': m.remito || '', TIPO: m.tipo, PRODUCTO: inN(m.insumo_id), CANTIDAD: r2(m.cantidad), 'USADO EN OT': r2(u.usada), QUEDA: r2(u.restante), DEPOSITO: cn(m.campo_id), APORTANTE: m.aportante || '', 'PRECIO USD': r2(m.precio_usd), FACTURA: m.factura || '', PROVEEDOR: m.proveedor || '' }; }), [11, 11, 9, 28, 10, 11, 10, 16, 10, 11, 10, 18]);
+    add('INSUMOS (catalogo)', S.insumos.map(i => ({ PRODUCTO: i.nombre, UNIDAD: i.unidad, CATEGORIA: i.categoria || '' })), [32, 8, 22]);
+    // 6. Costos varios, producción, cosecha
+    add('COSTOS VARIOS', S.costos_varios.map(c => ({ FECHA: c.fecha || '', CONCEPTO: c.concepto, CAMPO: c.campo_id ? cn(c.campo_id) : 'TODA LA AGRICULTURA', LOTE: c.lote_id ? (Store.lote(c.lote_id) || {}).nombre : '', 'MONTO $': r2(c.monto_ars), TC: r2(c.tc), 'MONTO USD': r2(c.monto_usd), 'SOCIO QUE PAGA': c.aportante || '', FACTURA: c.factura || '', OBS: c.obs || '' })), [11, 28, 20, 10, 12, 8, 11, 14, 10, 30]);
+    add('PRODUCCION', S.produccion.map(p => { const l = Store.lote(p.lote_id) || {}; return { CAMPO: cn(l.campo_id), LOTE: l.nombre || '', CULTIVO: l.cultivo || '', TIPO: p.tipo, HAS: r2(p.has), KG: r2(p.kg), 'TN': r2(num(p.kg) / 1000), 'RINDE QQ/HA': p.has ? r2(num(p.kg) / num(p.has) / 100) : '', ESTIMADO: p.estimado ? 'SI' : 'NO', 'PRECIO USD/TN (override)': r2(p.precio_usd_tn), FECHA: p.fecha || '', OBS: p.obs || '' }; }), [16, 10, 8, 9, 8, 12, 10, 12, 9, 14, 11, 30]);
+    add('COSECHA', S.cosechas.map(c => { const l = Store.lote(c.lote_id) || {}; return { FECHA: c.fecha || '', CAMPO: cn(l.campo_id), LOTE: l.nombre || '', CULTIVO: l.cultivo || '', CONTRATISTA: ctN(c.contratista_id), HAS: r2(c.has), '$/HA': r2(c.precio_ha_ars), TC: r2(c.tc), 'MONTO USD': r2(c.monto_usd), FACTURA: c.factura || '', ESTIMADO: c.estimado ? 'SI' : 'NO', 'SOCIO QUE PAGA': c.aportante || '', OBS: c.obs || '' }; }), [11, 16, 10, 8, 22, 8, 10, 8, 11, 10, 9, 14, 30]);
+    // 7. Resultados
+    const resRow = g => ({ '': g.label, HAS: r2(g.has), ALQUILER: r2(g.alquiler), INSUMOS: r2(g.insumos), LABORES: r2(g.labores), VARIOS: r2(g.varios), COSECHA: r2(g.cosecha), 'COSTO TOTAL': r2(g.costo), 'COSTO/HA': r2(g.costo_ha), KG: r2(g.kg), 'RINDE QQ/HA': g.kg ? r2(g.rinde / 100) : '', 'PRECIO NETO USD/TN': r2(g.precio_neto), VENTA: r2(g.venta), RESULTADO: g.kg ? r2(g.resultado) : '', 'RINDE INDIF. QQ/HA': r2(g.rinde_indif) });
+    const part = L.filter(r => r.participa);
+    const res = [...Calc.agrupar(part, r => r.campo.id + '|' + r.cultivo, r => r.campo.nombre + ' · ' + r.cultivo).map(resRow), { '': '' }, ...Calc.agrupar(part, r => r.cultivo, r => 'TOTAL ' + r.cultivo).map(resRow), ...Calc.agrupar(part, () => 'T', () => 'TOTAL SOCIEDAD').map(resRow)];
+    add('RESULTADOS', res, [26, 8, 11, 11, 11, 10, 11, 12, 10, 11, 12, 16, 11, 11, 16]);
+    add('RESULTADOS POR LOTE', L.map(r => ({ ...resRow({ ...r, label: r.campo.nombre + ' · L ' + r.lote.nombre }), 'EN SOCIEDAD': r.participa ? 'SI' : 'NO' })), [26, 8, 11, 11, 11, 10, 11, 12, 10, 11, 12, 16, 11, 11, 16, 10]);
+    // 8. Participación
+    const partRows = P.filas.map(f => ({ SOCIO: f.aportante, ALQUILER: r2(f.alquiler), INSUMOS: r2(f.insumos), LABORES: r2(f.labores), VARIOS: r2(f.varios), 'TOTAL APORTADO': r2(f.total), '% REAL': r2(f.pct * 100), '% PACTADO': r2(f.pct_pactada * 100), 'DIFERENCIA USD': r2(f.dif_usd) }));
+    partRows.push({ SOCIO: 'TOTAL', 'TOTAL APORTADO': r2(P.total), '% REAL': 100, '% PACTADO': 100 }); if (P.sinAsignar) partRows.push({ SOCIO: 'SIN ASIGNAR', 'TOTAL APORTADO': r2(P.sinAsignar) });
+    add('PARTICIPACION', partRows, [14, 11, 11, 11, 10, 14, 8, 10, 14]);
+    add('APORTES POR CATEGORIA', P.categorias.map(c => { const o = { CATEGORIA: c.categoria }; APORTANTES.forEach(a => o[a.id] = r2(c[a.id])); o['SIN ASIGNAR'] = r2(c['SIN ASIGNAR']); o.TOTAL = r2(c.total); return o; }), [26, 12, 12, 12, 12, 12]);
+    add('FUERA SOCIEDAD (deudas)', P.deudas.map(d => ({ CAMPO: d.campo.nombre, 'A CARGO DE': d.dueno, 'APORTO': d.acreedor, ALQUILER: r2(d.alquiler), INSUMOS: r2(d.insumos), LABORES: r2(d.labores), VARIOS: r2(d.varios), COSECHA: r2(d.cosecha), 'TOTAL USD': r2(d.total) })), [16, 12, 10, 10, 10, 10, 10, 10, 12]);
+    XLSX.writeFile(wb, `Agricultura_${S.campania.nombre.replace('/', '-')}_${hoy()}.xlsx`);
+    UI.toast('Excel descargado');
+  },
+};
+</script>
+
 </body>
 </html>
