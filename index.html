@@ -207,7 +207,7 @@ const CULTIVOS = ['SOJA', 'MAIZ'];
 const CICLOS = ['PRIMERA', 'SEGUNDA'];
 const UNIDADES = ['lt', 'kg', 'g', 'bolsa', 'big bag', 'tn', 'un'];
 const CATEGORIAS = ['HERBICIDA', 'INSECTICIDA', 'FUNGICIDA', 'COADYUVANTE', 'REGULADOR DE CRECIMIENTO', 'SEMILLA', 'MICROGRANULADO', 'FERTILIZANTE', 'UREA', 'FERT. FOLIAR/ARRANCADOR', 'OTROS'];
-const TABLAS_CAMPANIA = ['campos','lotes','precios_mes','ordenes','labores','movimientos_stock','costos_varios','produccion','cosechas'];
+const TABLAS_CAMPANIA = ['campos','lotes','precios_mes','ordenes','labores','movimientos_stock','costos_varios','produccion','cosechas','matches'];
 const TABLAS_GLOBAL = ['campanias','cotizaciones','insumos','contratistas','tipos_labor'];
 const TABLAS_HIJAS = { orden_lotes: 'ordenes', orden_insumos: 'ordenes' };
 
@@ -329,7 +329,7 @@ const Auth = {
 /* ---------------- estado en memoria ---------------- */
 const S = { campanias: [], campania: null, cotizaciones: [], insumos: [], contratistas: [], tipos_labor: [],
   campos: [], lotes: [], precios_mes: [], ordenes: [], orden_lotes: [], orden_insumos: [], labores: [],
-  movimientos_stock: [], costos_varios: [], produccion: [], cosechas: [] };
+  movimientos_stock: [], matches: [], costos_varios: [], produccion: [], cosechas: [] };
 
 const Store = {
   async loadGlobal() {
@@ -525,16 +525,35 @@ const Calc = {
   stockInsumo(insumoId, campoId) { return sum(S.movimientos_stock.filter(m => m.insumo_id === insumoId && (!campoId || m.campo_id === campoId)), m => m.cantidad); },
   ordenHas(ordenId) { return sum(S.orden_lotes.filter(x => x.orden_id === ordenId), x => x.has); },
   cantidadInsumo(oi, hasOrden) { return oi.modo === 'ha' ? num(oi.dosis) * hasOrden : num(oi.cantidad); },
+  /* costo de una salida de stock según sus matches con remitos.
+     partes: [{cantidad, remito (mov) | null, aportante, precio, estimado}] — el remanente sin match va a precio sugerido */
+  costoSalida(sal) {
+    const total = -num(sal.cantidad);
+    const partes = S.matches.filter(x => x.salida_mov_id === sal.id).map(x => {
+      const r = S.movimientos_stock.find(m => m.id === x.remito_mov_id);
+      const px = r && num(r.precio_usd) > 0 ? num(r.precio_usd) : null;
+      const sug = px === null ? this.precioSugerido(sal.insumo_id).precio : null;
+      return { cantidad: num(x.cantidad), remito: r || null, aportante: r ? (r.aportante || null) : null, precio: px ?? sug ?? 0, estimado: px === null };
+    });
+    const asignado = sum(partes, p => p.cantidad), pend = total - asignado;
+    if (pend > 1e-6) {
+      // sin match: si la salida tiene precio/aportante propio (carga directa) se respeta, si no se estima
+      const propio = num(sal.precio_usd) > 0 ? num(sal.precio_usd) : null;
+      partes.push({ cantidad: pend, remito: null, aportante: sal.aportante || null, precio: propio ?? this.precioSugerido(sal.insumo_id).precio ?? 0, estimado: propio === null });
+    }
+    const usd = sum(partes, p => p.cantidad * p.precio);
+    return { total, asignado, pendiente: Math.max(0, pend), partes, usd, precio_prom: total ? usd / total : 0, estimado: partes.some(p => p.estimado && p.cantidad > 1e-6) };
+  },
   costoInsumosOrden(ordenId) {
     const hasO = this.ordenHas(ordenId);
     return S.orden_insumos.filter(x => x.orden_id === ordenId).map(oi => {
       const cant = this.cantidadInsumo(oi, hasO);
       const sal = S.movimientos_stock.find(m => m.orden_insumo_id === oi.id);
-      const rem = sal && sal.remito_mov_id ? S.movimientos_stock.find(m => m.id === sal.remito_mov_id) : null;
-      const precio = sal && num(sal.precio_usd) > 0 ? num(sal.precio_usd) : (rem && num(rem.precio_usd) > 0 ? num(rem.precio_usd) : null);
-      const sug = precio === null ? this.precioSugerido(oi.insumo_id).precio : null;
-      const px = precio ?? sug ?? 0;
-      return { oi, cantidad: cant, precio, precio_usado: px, estimado: precio === null, aportante: sal ? (sal.aportante || (rem && rem.aportante) || null) : null, usd: cant * px, salida: sal };
+      let partes, usd, estimado;
+      if (sal) { const c = this.costoSalida(sal); partes = c.partes; usd = c.usd; estimado = c.estimado; }
+      else { const px = this.precioSugerido(oi.insumo_id).precio ?? 0; partes = [{ cantidad: cant, remito: null, aportante: null, precio: px, estimado: true }]; usd = cant * px; estimado = true; }
+      const aps = [...new Set(partes.map(p => p.aportante).filter(Boolean))];
+      return { oi, cantidad: cant, partes, precio_usado: cant ? usd / cant : 0, estimado, aportante: aps.length === 1 ? aps[0] : (aps.length ? 'MIXTO' : null), aportantes: aps, usd, salida: sal };
     });
   },
 
@@ -574,8 +593,9 @@ const Calc = {
       const ins = this.costoInsumosOrden(o.id);
       ols.forEach(ol => {
         const r = L(ol.lote_id); if (!r) return; const f = num(ol.has) / hasO;
-        ins.forEach(i => { const v = i.usd * f; r.insumos += v; if (i.estimado) r.estim.insumos += v; r.insumos_det.push({ orden: o, insumo: Store.insumo(i.oi.insumo_id), cantidad: i.cantidad * f, usd: v, aportante: i.aportante, estimado: i.estimado });
-          if (i.aportante) { r.aportes[i.aportante] = r.aportes[i.aportante] || { alquiler: 0, insumos: 0, labores: 0, varios: 0, cosecha: 0 }; r.aportes[i.aportante].insumos += v; } else r.sin_asignar += v; });
+        ins.forEach(i => i.partes.forEach(p => { const v = p.cantidad * p.precio * f; if (!v) return; r.insumos += v; if (p.estimado) r.estim.insumos += v;
+          r.insumos_det.push({ orden: o, insumo: Store.insumo(i.oi.insumo_id), cantidad: p.cantidad * f, usd: v, aportante: p.aportante, estimado: p.estimado, remito: p.remito });
+          if (p.aportante) { r.aportes[p.aportante] = r.aportes[p.aportante] || { alquiler: 0, insumos: 0, labores: 0, varios: 0, cosecha: 0 }; r.aportes[p.aportante].insumos += v; } else r.sin_asignar += v; }));
       });
     });
     S.labores.forEach(lb => {
@@ -932,7 +952,7 @@ Tabs.ordenes = {
         for (const ol of exist) { const nd = d.lotes.find(l => l.lote_id === ol.lote_id); if (!nd) { await DB.remove('orden_lotes', ol.id); await DB.removeWhere('labores', { orden_lote_id: ol.id }); } else { await DB.update('orden_lotes', ol.id, { has: nd.has, obs: nd.obs }); } }
         for (const l of d.lotes) if (!exist.some(x => x.lote_id === l.lote_id)) { const ol = await DB.insert('orden_lotes', { orden_id: orden.id, lote_id: l.lote_id, has: l.has, obs: l.obs }); await DB.insert('labores', { campania_id: S.campania.id, orden_id: orden.id, orden_lote_id: ol.id, contratista_id: d.contratista_id, has_reales: l.has, fecha: d.fecha, aportante: null }); }
         const existI = S.orden_insumos.filter(x => x.orden_id === orden.id);
-        for (const oi of existI) { const ni = d.insumos.find(i => i.insumo_id === oi.insumo_id); if (!ni) { await DB.removeWhere('movimientos_stock', { orden_insumo_id: oi.id }); await DB.remove('orden_insumos', oi.id); } else { const cant = ni.modo === 'ha' ? num(ni.dosis) * hasTot : num(ni.cantidad); await DB.update('orden_insumos', oi.id, { modo: ni.modo, dosis: ni.dosis, cantidad: cant, unidad: ni.unidad, obs: ni.obs }); const mv = S.movimientos_stock.find(m => m.orden_insumo_id === oi.id); if (mv) await DB.update('movimientos_stock', mv.id, { cantidad: -cant, fecha: d.fecha, campo_id: ni.deposito_id || campoSalida }); } }
+        for (const oi of existI) { const ni = d.insumos.find(i => i.insumo_id === oi.insumo_id); if (!ni) { for (const mv of S.movimientos_stock.filter(m => m.orden_insumo_id === oi.id)) await DB.removeWhere('matches', { salida_mov_id: mv.id }); await DB.removeWhere('movimientos_stock', { orden_insumo_id: oi.id }); await DB.remove('orden_insumos', oi.id); } else { const cant = ni.modo === 'ha' ? num(ni.dosis) * hasTot : num(ni.cantidad); await DB.update('orden_insumos', oi.id, { modo: ni.modo, dosis: ni.dosis, cantidad: cant, unidad: ni.unidad, obs: ni.obs }); const mv = S.movimientos_stock.find(m => m.orden_insumo_id === oi.id); if (mv) { await DB.update('movimientos_stock', mv.id, { cantidad: -cant, fecha: d.fecha, campo_id: ni.deposito_id || campoSalida }); await this.recortarMatches(mv.id, cant); } } }
         for (const i of d.insumos) if (!existI.some(x => x.insumo_id === i.insumo_id)) await this.insertInsumo(orden, i, hasTot, campoSalida);
       } else {
         orden = await DB.insert('ordenes', { ...base, campania_id: S.campania.id, created_at: new Date().toISOString() });
@@ -943,6 +963,12 @@ Tabs.ordenes = {
       this.limpiar(); this.renderList();
       PDF.orden(orden.id);
     }, this.editId ? 'Orden actualizada' : 'Orden generada');
+  },
+  /* si la cantidad de la OT baja por debajo de lo ya matcheado, se recortan los matches más recientes */
+  async recortarMatches(salId, nuevaCant) {
+    const ms = S.matches.filter(x => x.salida_mov_id === salId).sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
+    let exceso = sum(ms, x => x.cantidad) - nuevaCant;
+    for (const x of ms) { if (exceso <= 1e-6) break; if (x.cantidad <= exceso + 1e-6) { await DB.remove('matches', x.id); exceso -= x.cantidad; } else { await DB.update('matches', x.id, { cantidad: +(x.cantidad - exceso).toFixed(2) }); exceso = 0; } }
   },
   async insertInsumo(orden, i, hasTot, campoSalida) {
     const cant = i.modo === 'ha' ? num(i.dosis) * hasTot : num(i.cantidad);
@@ -990,7 +1016,7 @@ Tabs.ordenes = {
   },
   async eliminar(id) {
     const o = Store.orden(id); if (!confirm(`¿Eliminar la orden N° ${o.numero}? Se borran sus labores y salidas de stock.`)) return;
-    await UI.run(async () => { await DB.removeWhere('movimientos_stock', { orden_id: id }); await DB.remove('ordenes', id); await Store.loadCampania(S.campania.id); if (this.editId === id) this.limpiar(); App.render(); }, 'Orden eliminada');
+    await UI.run(async () => { for (const mv of S.movimientos_stock.filter(m => m.orden_id === id)) await DB.removeWhere('matches', { salida_mov_id: mv.id }); await DB.removeWhere('movimientos_stock', { orden_id: id }); await DB.remove('ordenes', id); await Store.loadCampania(S.campania.id); if (this.editId === id) this.limpiar(); App.render(); }, 'Orden eliminada');
   },
 };
 
@@ -1113,93 +1139,180 @@ Tabs.labores = {
 <script>
 /* =====================================================================
    PESTAÑA 4 — STOCK DE INSUMOS
+   Modelo: los REMITOS (compras / stock inicial) suman stock; las SALIDAS de
+   las órdenes de trabajo restan stock. Aparte, cada salida se "machea" con
+   uno o más remitos (tabla matches, en kg/lt) para saber de qué remito salió
+   cada insumo, a qué precio y quién lo aportó.
    ===================================================================== */
 Tabs.stock = {
-  sub: 'pend', mvFiltro: '', mvDep: '', mvTipo: '', remFiltro: { deposito: '', aportante: '', texto: '' },
+  sub: 'match', modo: 'orden', mvFiltro: '', mvDep: '', mvTipo: '',
+  pf: { insumo: '', deposito: '', aportante: '' },    // filtro remitos sin precio
+  mf: { insumo: '', campo: '' },                      // filtro match
   render(m) {
-    const pend = S.movimientos_stock.filter(x => x.tipo === 'salida' && !x.facturado);
-    m.innerHTML = `<div class="subtabs"><button class="${this.sub === 'pend' ? 'active' : ''}" onclick="Tabs.stock.go('pend')">Pendientes de facturar / remitir ${pend.length ? `<span class="tag bad">${pend.length}</span>` : ''}</button><button class="${this.sub === 'compras' ? 'active' : ''}" onclick="Tabs.stock.go('compras')">Cargar remito / compra / stock inicial</button><button class="${this.sub === 'stock' ? 'active' : ''}" onclick="Tabs.stock.go('stock')">Stock actual</button><button class="${this.sub === 'mov' ? 'active' : ''}" onclick="Tabs.stock.go('mov')">Movimientos</button></div><div id="sub"></div>`;
+    const sinPrecio = this.remitosSinPrecio().length, pendOT = this.salidasPendientes().length, remAb = this.remitosAbiertos().length;
+    m.innerHTML = `<div class="subtabs">
+      <button class="${this.sub === 'match' ? 'active' : ''}" onclick="Tabs.stock.go('match')">Match OT ↔ remitos ${pendOT ? `<span class="tag bad">${pendOT}</span>` : ''}</button>
+      <button class="${this.sub === 'precio' ? 'active' : ''}" onclick="Tabs.stock.go('precio')">Remitos sin precio ${sinPrecio ? `<span class="tag warn">${sinPrecio}</span>` : ''}</button>
+      <button class="${this.sub === 'compras' ? 'active' : ''}" onclick="Tabs.stock.go('compras')">Cargar remito / stock inicial</button>
+      <button class="${this.sub === 'stock' ? 'active' : ''}" onclick="Tabs.stock.go('stock')">Stock actual</button>
+      <button class="${this.sub === 'mov' ? 'active' : ''}" onclick="Tabs.stock.go('mov')">Movimientos</button></div><div id="sub"></div>`;
     const s = document.getElementById('sub');
-    ({ pend: this.renderPend, compras: this.renderCompras, stock: this.renderStock, mov: this.renderMov })[this.sub].call(this, s);
+    ({ match: this.renderMatch, precio: this.renderPrecio, compras: this.renderCompras, stock: this.renderStock, mov: this.renderMov })[this.sub].call(this, s);
   },
   go(s) { this.sub = s; App.render(); },
 
-  /* ---- remitos cargados: cuánto se usó y cuánto queda ---- */
-  remitoUso(mv) { const usada = sum(S.movimientos_stock.filter(x => x.remito_mov_id === mv.id), x => -x.cantidad); return { usada, restante: num(mv.cantidad) - usada }; },
-  remitosAbiertos(insumoId) { return S.movimientos_stock.filter(m => m.cantidad > 0 && (!insumoId || m.insumo_id === insumoId) && this.remitoUso(m).restante > 1e-6).sort((a, b) => (a.fecha || '').localeCompare(b.fecha || '')); },
-  remitoLabel(m) { const u = this.remitoUso(m); return `Rem. ${m.remito || 's/n'} · ${fdate(m.fecha)} · ${m.aportante || '—'} · ${(Store.campo(m.campo_id) || {}).nombre || 'sin dep.'} · quedan ${fmt(u.restante, 1)}`; },
+  /* ================= helpers de match ================= */
+  esRemito: m => m.cantidad > 0 && (m.tipo === 'compra' || m.tipo === 'inicial'),
+  matchesRemito(id) { return S.matches.filter(x => x.remito_mov_id === id); },
+  matchesSalida(id) { return S.matches.filter(x => x.salida_mov_id === id); },
+  remitoUso(m) { const usada = sum(this.matchesRemito(m.id), x => x.cantidad); return { usada, restante: num(m.cantidad) - usada }; },
+  salidaUso(sal) { const asignado = sum(this.matchesSalida(sal.id), x => x.cantidad); return { usado: -num(sal.cantidad), asignado, pendiente: -num(sal.cantidad) - asignado }; },
+  remitosAbiertos(insumoId) { return S.movimientos_stock.filter(m => this.esRemito(m) && (!insumoId || m.insumo_id === insumoId) && this.remitoUso(m).restante > 1e-6).sort((a, b) => (a.fecha || '').localeCompare(b.fecha || '')); },
+  salidasPendientes(insumoId) { return S.movimientos_stock.filter(m => m.tipo === 'salida' && (!insumoId || m.insumo_id === insumoId) && this.salidaUso(m).pendiente > 1e-6).sort((a, b) => (a.fecha || '').localeCompare(b.fecha || '')); },
+  remitosSinPrecio() { return S.movimientos_stock.filter(m => this.esRemito(m) && !(num(m.precio_usd) > 0)); },
+  remLabel(m) { return `Rem. ${m.remito || 's/n'} · ${fdate(m.fecha)} · ${(Store.campo(m.campo_id) || {}).nombre || 'sin dep.'} · ${m.aportante || '—'}`; },
+  salLabel(sal) { const o = Store.orden(sal.orden_id) || {}; return `OT ${o.numero || '—'} · ${fdate(sal.fecha)} · ${(Store.campo(sal.campo_id) || {}).nombre || ''}`; },
+  async reload() { S.movimientos_stock = await DB.select('movimientos_stock', { campania_id: S.campania.id }); S.matches = await DB.select('matches', { campania_id: S.campania.id }); },
 
-  /* ---- pendientes de facturar / remitir ---- */
-  renderPend(s) {
-    const pend = S.movimientos_stock.filter(x => x.tipo === 'salida' && !x.facturado);
-    const g = by(pend, x => x.campo_id || '');
-    s.innerHTML = `<div class="note info">Cada insumo usado en una orden aparece acá hasta que se le asigne de dónde salió: <b>un remito ya cargado</b> (se le descuenta a ese remito y toma su precio, aportante y factura) o un <b>remito/aportante nuevo</b>. No hace falta tener precio ni factura: se pueden completar después desde <b>Movimientos</b> (Editar). Si el remito nuevo trae más cantidad que la usada, el sobrante queda en el depósito.</div>
-    ${pend.length ? `<div class="btn-group" style="margin-bottom:10px"><button class="btn primary sm" onclick="Tabs.stock.confirmarTodos()">Confirmar todos los que tengan datos</button></div>` : ''}
-    ${Object.entries(g).map(([cid, arr]) => `<div class="card"><h3>Depósito ${esc((Store.campo(cid) || { nombre: 'sin asignar' }).nombre)} <span class="muted small">${arr.length} ítems</span></h3>
-      <div class="tablewrap"><table class="t compact"><thead><tr><th>OT</th><th>Fecha</th><th>Insumo</th><th class="num">Usado</th><th>Remito ya cargado</th><th>Aportante</th><th class="num">Precio USD</th><th>Remito nuevo</th><th>Factura</th><th class="num">Cant. remitida</th><th></th></tr></thead><tbody>
-      ${arr.map(mv => { const i = Store.insumo(mv.insumo_id) || {}; const o = Store.orden(mv.orden_id) || {}; const sug = Calc.precioSugerido(mv.insumo_id); const px = mv.precio_usd ?? ''; const ap = mv.aportante || ''; const rems = this.remitosAbiertos(mv.insumo_id);
-        return `<tr data-id="${mv.id}"><td><b>${o.numero || '—'}</b></td><td>${fdate(mv.fecha)}</td><td><b>${esc(i.nombre)}</b> <span class="muted small">${esc(i.unidad)}</span></td><td class="num">${fmt(-mv.cantidad, 2)}</td>
-        <td><select class="p-rm" onchange="Tabs.stock.pendRemito(this)"><option value="">— remito nuevo / sin remito —</option>${rems.map(r => `<option value="${r.id}">${esc(this.remitoLabel(r))}</option>`).join('')}</select></td>
-        <td><select class="p-ap">${optsAp(ap, '—')}</select></td>
-        <td class="num"><input type="number" step="0.01" class="p-precio" value="${px}" placeholder="${sug.precio ? 'sug. ' + sug.precio : ''}"></td>
-        <td><input type="text" class="p-rem" style="width:90px" value="${esc(mv.remito || '')}"></td><td><input type="text" class="p-fac" style="width:90px" value="${esc(mv.factura || '')}" placeholder="opcional"></td>
-        <td class="num"><input type="number" step="0.01" class="p-cant" value="${-mv.cantidad}"></td>
-        <td class="actions"><button class="btn xs primary" onclick="Tabs.stock.confirmarUno('${mv.id}')">Confirmar</button></td></tr>`; }).join('')}</tbody></table></div></div>`).join('') || '<div class="card"><p class="muted">No hay insumos pendientes de facturar o remitir. 🎉</p></div>'}`;
+  /* ================= MATCH OT ↔ REMITOS ================= */
+  renderMatch(s) {
+    const f = this.mf;
+    const insumosPend = [...new Set([...this.salidasPendientes(), ...this.remitosAbiertos()].map(m => m.insumo_id))].map(id => Store.insumo(id)).filter(Boolean).sort((a, b) => a.nombre.localeCompare(b.nombre));
+    const filt = arr => arr.filter(m => (!f.insumo || m.insumo_id === f.insumo) && (!f.campo || m.campo_id === f.campo));
+    const sal = filt(this.salidasPendientes()), rem = filt(this.remitosAbiertos());
+    s.innerHTML = `<div class="note info">Cada salida de una orden de trabajo se <b>machea</b> con los remitos del mismo insumo: se le asignan kg/lt de cada remito hasta cubrirla. Si el remito no alcanza, la orden queda <b>cubierta parcialmente</b> o se ajusta su cantidad a lo que dice el remito. Lo que sobra de un remito queda como <b>remito pendiente de match</b>. Del match salen el precio y el aportante de cada insumo aplicado.</div>
+    <div class="row" style="margin-bottom:10px"><div class="w2"><label class="f">Insumo</label><select onchange="Tabs.stock.mf.insumo=this.value;App.render()">${opts(insumosPend, f.insumo, i => i.nombre, i => i.id, 'Todos los insumos')}</select></div><div><label class="f">Campo / depósito</label><select onchange="Tabs.stock.mf.campo=this.value;App.render()">${opts(S.campos, f.campo, c => c.nombre, c => c.id, 'Todos')}</select></div>
+      <div class="auto"><div class="subtabs" style="margin:0"><button class="${this.modo === 'orden' ? 'active' : ''}" onclick="Tabs.stock.modo='orden';App.render()">Por orden de trabajo</button><button class="${this.modo === 'remito' ? 'active' : ''}" onclick="Tabs.stock.modo='remito';App.render()">Por remito</button></div></div></div>
+    ${this.modo === 'orden' ? `<div class="card"><h2>Insumos de órdenes pendientes de match <span class="muted small">${sal.length}</span>${sal.length ? `<span class="spacer"></span><button class="btn sm primary" onclick="Tabs.stock.autoTodo()">Auto-match FIFO de todo lo filtrado</button>` : ''}</h2>
+      <div class="tablewrap"><table class="t compact"><thead><tr><th>OT</th><th>Fecha</th><th>Campo</th><th>Insumo</th><th class="num">Usado</th><th class="num">Ya matcheado</th><th class="num">Pendiente</th><th class="num">Remitos disponibles</th><th></th></tr></thead><tbody>
+      ${sal.map(x => { const u = this.salidaUso(x); const i = Store.insumo(x.insumo_id) || {}; const o = Store.orden(x.orden_id) || {}; const disp = sum(this.remitosAbiertos(x.insumo_id), r => this.remitoUso(r).restante);
+        return `<tr><td><b>${o.numero || '—'}</b></td><td class="nowrap">${fdate(x.fecha)}</td><td>${esc((Store.campo(x.campo_id) || {}).nombre || '')}</td><td><b>${esc(i.nombre)}</b> <span class="muted small">${esc(i.unidad)}</span></td><td class="num">${fmt(u.usado, 2)}</td><td class="num">${u.asignado ? fmt(u.asignado, 2) : ''}</td><td class="num"><b class="neg">${fmt(u.pendiente, 2)}</b></td><td class="num ${disp < u.pendiente - 1e-6 ? 'neg' : ''}">${fmt(disp, 2)}</td><td class="actions"><button class="btn xs primary" onclick="Tabs.stock.matchOrden('${x.id}')">Matchear</button></td></tr>`; }).join('') || '<tr><td colspan="9" class="muted">Todas las salidas de órdenes están matcheadas. 🎉</td></tr>'}</tbody></table></div></div>`
+    : `<div class="card"><h2>Remitos pendientes de match (con remanente) <span class="muted small">${rem.length}</span></h2>
+      <div class="tablewrap"><table class="t compact"><thead><tr><th>Fecha</th><th>Remito</th><th>Insumo</th><th class="num">Cantidad</th><th class="num">Matcheado</th><th class="num">Remanente</th><th>Depósito</th><th>Aportante</th><th class="num">Precio USD</th><th class="num">OT pendientes</th><th></th></tr></thead><tbody>
+      ${rem.map(m => { const u = this.remitoUso(m); const i = Store.insumo(m.insumo_id) || {}; const pend = sum(this.salidasPendientes(m.insumo_id), x => this.salidaUso(x).pendiente);
+        return `<tr><td class="nowrap">${fdate(m.fecha)}</td><td><b>${esc(m.remito || 's/n')}</b> <span class="tag gray">${m.tipo}</span></td><td><b>${esc(i.nombre)}</b> <span class="muted small">${esc(i.unidad)}</span></td><td class="num">${fmt(m.cantidad, 2)}</td><td class="num">${u.usada ? fmt(u.usada, 2) : ''}</td><td class="num"><b>${fmt(u.restante, 2)}</b></td><td class="small">${esc((Store.campo(m.campo_id) || {}).nombre || '—')}</td><td>${tagAp(m.aportante)}</td><td class="num">${m.precio_usd ? fmt(m.precio_usd, 2) : '<span class="tag warn">s/precio</span>'}</td><td class="num">${pend ? fmt(pend, 2) : '<span class="muted">—</span>'}</td><td class="actions">${pend ? `<button class="btn xs primary" onclick="Tabs.stock.matchRemito('${m.id}')">Matchear</button>` : '<span class="tag ok">en depósito</span>'}</td></tr>`; }).join('') || '<tr><td colspan="11" class="muted">No hay remitos con remanente.</td></tr>'}</tbody></table></div>
+      <p class="muted small">Un remito con remanente y sin órdenes pendientes de ese insumo es simplemente stock en depósito.</p></div>`}
+    <div class="card"><h2>Matches realizados <span class="muted small">${S.matches.length}</span></h2><div class="tablewrap"><table class="t compact"><thead><tr><th>OT</th><th>Insumo</th><th class="num">Cantidad</th><th>Remito</th><th>Aportante</th><th class="num">Precio USD</th><th class="num">USD</th><th></th></tr></thead><tbody>
+      ${S.matches.map(x => { const sal = S.movimientos_stock.find(m => m.id === x.salida_mov_id), r = S.movimientos_stock.find(m => m.id === x.remito_mov_id); if (!sal || !r) return ''; if (f.insumo && sal.insumo_id !== f.insumo) return ''; const o = Store.orden(sal.orden_id) || {}; return `<tr><td><b>${o.numero || '—'}</b> <span class="muted small">${esc((Store.campo(sal.campo_id) || {}).nombre || '')}</span></td><td>${esc((Store.insumo(sal.insumo_id) || {}).nombre)}</td><td class="num">${fmt(x.cantidad, 2)}</td><td>${esc(r.remito || 's/n')} <span class="muted small">${fdate(r.fecha)}</span></td><td>${tagAp(r.aportante)}</td><td class="num">${r.precio_usd ? fmt(r.precio_usd, 2) : '<span class="tag warn">s/precio</span>'}</td><td class="num">${r.precio_usd ? fmt(x.cantidad * r.precio_usd) : ''}</td><td class="actions"><button class="btn xs danger" title="Deshacer match" onclick="Tabs.stock.borrarMatch('${x.id}')">✕</button></td></tr>`; }).join('') || '<tr><td colspan="8" class="muted">Sin matches todavía.</td></tr>'}</tbody></table></div></div>`;
   },
-  pendRemito(sel) {
-    const tr = sel.closest('tr'); const r = S.movimientos_stock.find(x => x.id === sel.value);
-    const set = (cls, v, dis) => { const e = tr.querySelector(cls); e.value = v; e.disabled = dis; };
-    if (r) { set('.p-ap', r.aportante || '', true); set('.p-precio', r.precio_usd ?? '', true); set('.p-rem', r.remito || '', true); set('.p-fac', r.factura || '', true); set('.p-cant', -num(S.movimientos_stock.find(x => x.id === tr.dataset.id).cantidad), true); }
-    else { ['.p-ap', '.p-precio', '.p-rem', '.p-fac', '.p-cant'].forEach(c => tr.querySelector(c).disabled = false); }
+  /* --- modal por orden: asignar remitos a una salida --- */
+  matchOrden(salId) {
+    const sal = S.movimientos_stock.find(m => m.id === salId); const u = this.salidaUso(sal); const i = Store.insumo(sal.insumo_id) || {}; const rems = this.remitosAbiertos(sal.insumo_id);
+    UI.modal(`<h3>Match · ${esc(this.salLabel(sal))}</h3><p><b>${esc(i.nombre)}</b> · usado ${fmt(u.usado, 2)} ${esc(i.unidad)} · ya asignado ${fmt(u.asignado, 2)} · <b class="neg">pendiente ${fmt(u.pendiente, 2)}</b></p>
+      ${rems.length ? `<div class="btn-group" style="margin-bottom:8px"><button class="btn sm" onclick="Tabs.stock.fifo(${u.pendiente})">Repartir FIFO (más viejo primero)</button><button class="btn sm" onclick="document.querySelectorAll('.mt-q').forEach(e=>e.value='')">Limpiar</button></div>
+      <div class="tablewrap"><table class="t compact"><thead><tr><th>Remito</th><th>Fecha</th><th>Depósito</th><th>Aportante</th><th class="num">Precio</th><th class="num">Remanente</th><th class="num">Asignar</th></tr></thead><tbody>
+      ${rems.map(r => `<tr data-rem="${r.id}" data-rest="${this.remitoUso(r).restante}"><td><b>${esc(r.remito || 's/n')}</b> <span class="tag gray">${r.tipo}</span></td><td class="nowrap">${fdate(r.fecha)}</td><td class="small">${esc((Store.campo(r.campo_id) || {}).nombre || '—')}</td><td>${tagAp(r.aportante)}</td><td class="num">${r.precio_usd ? fmt(r.precio_usd, 2) : '<span class="tag warn">s/p</span>'}</td><td class="num">${fmt(this.remitoUso(r).restante, 2)}</td><td class="num"><input type="number" step="0.01" class="mt-q" min="0" oninput="Tabs.stock.mtTotal()"></td></tr>`).join('')}</tbody>
+      <tfoot><tr><td colspan="6">Total a asignar</td><td class="num" id="mt-total">0</td></tr></tfoot></table></div>` : '<div class="note">No hay remitos de este insumo con remanente. Cargá el remito en “Cargar remito / stock inicial” y volvé acá.</div>'}
+      <div class="foot"><button class="btn" onclick="UI.closeModal()">Cancelar</button>${rems.length ? `<button class="btn primary" onclick="Tabs.stock.guardarMatchOrden('${sal.id}')">Guardar match</button>` : ''}</div>`);
+    document.getElementById('modal').style.maxWidth = '960px';
   },
-  async confirmar(id, silent) {
-    const tr = document.querySelector(`tr[data-id="${id}"]`); const mv = S.movimientos_stock.find(x => x.id === id); const usado = -mv.cantidad;
-    const rmId = tr.querySelector('.p-rm').value;
-    if (rmId) {
-      const r = S.movimientos_stock.find(x => x.id === rmId); const u = this.remitoUso(r);
-      if (u.restante < usado - 1e-6 && !silent && !confirm(`Al remito ${r.remito || ''} le quedan ${fmt(u.restante, 1)} y la orden usó ${fmt(usado, 1)}. ¿Descontar igual?`)) return false;
-      await DB.update('movimientos_stock', id, { remito_mov_id: rmId, precio_usd: r.precio_usd ?? null, aportante: r.aportante || null, remito: r.remito || '', factura: r.factura || '', facturado: true });
-      return true;
+  fifo(pend) { let rest = pend; document.querySelectorAll('tr[data-rem]').forEach(tr => { const r = num(tr.dataset.rest); const q = Math.min(r, Math.max(0, rest)); tr.querySelector('.mt-q').value = q > 1e-9 ? +q.toFixed(2) : ''; rest -= q; }); this.mtTotal(); },
+  mtTotal() { const t = sum([...document.querySelectorAll('.mt-q')], e => e.value); const el = document.getElementById('mt-total'); if (el) el.textContent = fmt(t, 2); },
+  leerAsignaciones(attr) {
+    const out = []; let err = null;
+    document.querySelectorAll(`tr[data-${attr}]`).forEach(tr => { const q = num(tr.querySelector('.mt-q').value); if (q > 1e-9) { if (q > num(tr.dataset.rest) + 1e-6) err = 'Una asignación supera el remanente disponible'; out.push({ id: tr.dataset[attr], q }); } });
+    return { out, err };
+  },
+  async guardarMatchOrden(salId) {
+    const sal = S.movimientos_stock.find(m => m.id === salId); const u = this.salidaUso(sal);
+    const { out, err } = this.leerAsignaciones('rem'); if (err) return UI.toast(err, true); if (!out.length) return UI.toast('No asignaste cantidades', true);
+    const total = sum(out, x => x.q);
+    if (total > u.pendiente + 1e-6) return UI.toast(`Asignaste ${fmt(total, 2)} pero la orden sólo tiene ${fmt(u.pendiente, 2)} pendiente`, true);
+    const grabar = async (ajustar) => {
+      await UI.run(async () => {
+        for (const x of out) await DB.insert('matches', { campania_id: S.campania.id, salida_mov_id: salId, remito_mov_id: x.id, cantidad: x.q, created_at: new Date().toISOString() });
+        if (ajustar) { // la OT pasa a la cantidad realmente cubierta
+          const nueva = u.asignado + total; await DB.update('movimientos_stock', salId, { cantidad: -nueva });
+          if (sal.orden_insumo_id) { const oi = S.orden_insumos.find(x => x.id === sal.orden_insumo_id); if (oi) { const hasT = Calc.ordenHas(oi.orden_id); await DB.update('orden_insumos', oi.id, { cantidad: nueva, modo: 'total', dosis: hasT ? nueva / hasT : 0 }); oi.cantidad = nueva; oi.modo = 'total'; oi.dosis = hasT ? nueva / hasT : 0; } }
+        }
+        await this.reload(); UI.closeModal(); App.render();
+      }, ajustar ? 'Match guardado y orden ajustada' : 'Match guardado');
+    };
+    if (total < u.pendiente - 1e-6) {
+      const i = Store.insumo(sal.insumo_id) || {};
+      UI.modal(`<h3>La orden queda cubierta parcialmente</h3><p>Asignaste <b>${fmt(total, 2)} ${esc(i.unidad)}</b> y la orden tiene <b>${fmt(u.pendiente, 2)}</b> pendientes de <b>${esc(i.nombre)}</b>. ¿Qué hacemos?</p>
+        <div class="foot" style="justify-content:flex-start;flex-wrap:wrap"><button class="btn primary" onclick="Tabs.stock._g(true)">Ajustar la orden a ${fmt(u.asignado + total, 2)} (lo que dice el remito)</button><button class="btn" onclick="Tabs.stock._g(false)">Dejar ${fmt(u.pendiente - total, 2)} pendientes en la orden</button><button class="btn" onclick="UI.closeModal()">Cancelar</button></div>`);
+      this._g = grabar; return;
     }
-    const precio = num(tr.querySelector('.p-precio').value), ap = tr.querySelector('.p-ap').value, rem = tr.querySelector('.p-rem').value.trim(), fac = tr.querySelector('.p-fac').value.trim(), cant = num(tr.querySelector('.p-cant').value);
-    if (!ap) { if (!silent) UI.toast('Elegí el aportante (quién puso el insumo) o un remito ya cargado', true); return false; }
-    await DB.update('movimientos_stock', id, { precio_usd: precio || null, aportante: ap, remito: rem, factura: fac, facturado: true, remito_mov_id: null });
-    if (cant > usado + 1e-9) await DB.insert('movimientos_stock', { campania_id: S.campania.id, fecha: mv.fecha, tipo: 'compra', insumo_id: mv.insumo_id, cantidad: cant - usado, precio_usd: precio || null, remito: rem, factura: fac, aportante: ap, campo_id: mv.campo_id, facturado: true, obs: 'Sobrante remito (OT ' + ((Store.orden(mv.orden_id) || {}).numero || '') + ')', created_at: new Date().toISOString() });
-    return true;
+    await grabar(false);
   },
-  async confirmarUno(id) { await UI.run(async () => { if (await this.confirmar(id)) { S.movimientos_stock = await DB.select('movimientos_stock', { campania_id: S.campania.id }); App.render(); UI.toast('Confirmado'); } }); },
-  async confirmarTodos() {
-    const ids = S.movimientos_stock.filter(x => x.tipo === 'salida' && !x.facturado).map(x => x.id); let n = 0;
-    await UI.run(async () => { for (const id of ids) if (await this.confirmar(id, true)) n++; S.movimientos_stock = await DB.select('movimientos_stock', { campania_id: S.campania.id }); App.render(); }, `${n} ítems confirmados`);
+  /* --- modal por remito: repartir un remito entre órdenes --- */
+  matchRemito(remId) {
+    const r = S.movimientos_stock.find(m => m.id === remId); const u = this.remitoUso(r); const i = Store.insumo(r.insumo_id) || {}; const sals = this.salidasPendientes(r.insumo_id);
+    UI.modal(`<h3>Match · ${esc(this.remLabel(r))}</h3><p><b>${esc(i.nombre)}</b> · cantidad ${fmt(r.cantidad, 2)} ${esc(i.unidad)} · matcheado ${fmt(u.usada, 2)} · <b>remanente ${fmt(u.restante, 2)}</b></p>
+      <div class="btn-group" style="margin-bottom:8px"><button class="btn sm" onclick="Tabs.stock.fifoSal(${u.restante})">Repartir FIFO (orden más vieja primero)</button><button class="btn sm" onclick="document.querySelectorAll('.mt-q').forEach(e=>e.value='')">Limpiar</button></div>
+      <div class="tablewrap"><table class="t compact"><thead><tr><th>OT</th><th>Fecha</th><th>Campo</th><th class="num">Usado</th><th class="num">Pendiente</th><th class="num">Asignar</th></tr></thead><tbody>
+      ${sals.map(x => { const su = this.salidaUso(x); const o = Store.orden(x.orden_id) || {}; return `<tr data-sal="${x.id}" data-rest="${su.pendiente}"><td><b>OT ${o.numero || '—'}</b></td><td class="nowrap">${fdate(x.fecha)}</td><td class="small">${esc((Store.campo(x.campo_id) || {}).nombre || '')}</td><td class="num">${fmt(su.usado, 2)}</td><td class="num">${fmt(su.pendiente, 2)}</td><td class="num"><input type="number" step="0.01" class="mt-q" min="0" oninput="Tabs.stock.mtTotal()"></td></tr>`; }).join('')}</tbody>
+      <tfoot><tr><td colspan="5">Total a asignar (máx. ${fmt(u.restante, 2)})</td><td class="num" id="mt-total">0</td></tr></tfoot></table></div>
+      <div class="foot"><button class="btn" onclick="UI.closeModal()">Cancelar</button><button class="btn primary" onclick="Tabs.stock.guardarMatchRemito('${r.id}')">Guardar match</button></div>`);
+    document.getElementById('modal').style.maxWidth = '900px';
+  },
+  fifoSal(rest) { document.querySelectorAll('tr[data-sal]').forEach(tr => { const p = num(tr.dataset.rest); const q = Math.min(p, Math.max(0, rest)); tr.querySelector('.mt-q').value = q > 1e-9 ? +q.toFixed(2) : ''; rest -= q; }); this.mtTotal(); },
+  async guardarMatchRemito(remId) {
+    const r = S.movimientos_stock.find(m => m.id === remId); const u = this.remitoUso(r);
+    const { out, err } = this.leerAsignaciones('sal'); if (err) return UI.toast(err, true); if (!out.length) return UI.toast('No asignaste cantidades', true);
+    const total = sum(out, x => x.q); if (total > u.restante + 1e-6) return UI.toast(`Asignaste ${fmt(total, 2)} y el remito sólo tiene ${fmt(u.restante, 2)} de remanente`, true);
+    await UI.run(async () => { for (const x of out) await DB.insert('matches', { campania_id: S.campania.id, salida_mov_id: x.id, remito_mov_id: remId, cantidad: x.q, created_at: new Date().toISOString() }); await this.reload(); UI.closeModal(); App.render(); }, `Match guardado · quedan ${fmt(u.restante - total, 2)} en el remito`);
+  },
+  async autoTodo() {
+    const f = this.mf; const sals = this.salidasPendientes().filter(m => (!f.insumo || m.insumo_id === f.insumo) && (!f.campo || m.campo_id === f.campo)); let n = 0;
+    await UI.run(async () => {
+      for (const sal of sals) { let pend = this.salidaUso(sal).pendiente; for (const r of this.remitosAbiertos(sal.insumo_id)) { if (pend <= 1e-6) break; const q = Math.min(pend, this.remitoUso(r).restante); if (q <= 1e-6) continue; const m = await DB.insert('matches', { campania_id: S.campania.id, salida_mov_id: sal.id, remito_mov_id: r.id, cantidad: +q.toFixed(2), created_at: new Date().toISOString() }); S.matches.push(m); pend -= q; n++; } }
+      await this.reload(); App.render();
+    }, `${n} matches creados (lo que no alcanzó queda pendiente)`);
+  },
+  async borrarMatch(id) { await UI.run(async () => { await DB.remove('matches', id); await this.reload(); App.render(); }, 'Match deshecho'); },
+
+  /* ================= REMITOS SIN PRECIO ================= */
+  renderPrecio(s) {
+    const f = this.pf; let rows = this.remitosSinPrecio();
+    const insumos = [...new Set(rows.map(m => m.insumo_id))].map(id => Store.insumo(id)).filter(Boolean).sort((a, b) => a.nombre.localeCompare(b.nombre));
+    rows = rows.filter(m => (!f.insumo || m.insumo_id === f.insumo) && (!f.deposito || m.campo_id === f.deposito) && (!f.aportante || m.aportante === f.aportante)).sort((a, b) => ((Store.insumo(a.insumo_id) || {}).nombre || '').localeCompare((Store.insumo(b.insumo_id) || {}).nombre || '') || (a.fecha || '').localeCompare(b.fecha || ''));
+    s.innerHTML = `<div class="note info">Remitos cargados (compras y stock inicial) que todavía <b>no tienen precio</b>. Filtrá por insumo, tildá los remitos y asignales el precio (y la factura) de una vez. Al tener precio salen de acá: ya están en Movimientos y su precio pasa a las órdenes matcheadas.</div>
+    <div class="row" style="margin-bottom:10px"><div class="w2"><label class="f">Insumo</label><select onchange="Tabs.stock.pf.insumo=this.value;App.render()">${opts(insumos, f.insumo, i => i.nombre, i => i.id, 'Todos')}</select></div><div><label class="f">Depósito</label><select onchange="Tabs.stock.pf.deposito=this.value;App.render()">${opts(S.campos, f.deposito, c => c.nombre, c => c.id, 'Todos')}</select></div><div><label class="f">Aportante</label><select onchange="Tabs.stock.pf.aportante=this.value;App.render()">${optsAp(f.aportante, 'Todos')}</select></div><div class="auto"><button class="btn sm" onclick="Tabs.stock.pf={insumo:'',deposito:'',aportante:''};App.render()">Limpiar</button></div></div>
+    <div class="card"><h2>Asignar precio en bloque</h2><div class="row"><div><label class="f">Precio USD / unidad</label><input type="number" step="0.01" id="pb-precio"></div><div><label class="f">N° factura (opcional)</label><input type="text" id="pb-fac"></div><div><label class="f">Aportante (opcional, pisa)</label><select id="pb-ap">${optsAp('', '— no cambiar —')}</select></div><div class="auto"><button class="btn primary" onclick="Tabs.stock.precioMasivo()">Aplicar a los tildados</button></div></div>
+      <p class="muted small" style="margin-top:6px">Ejemplo: filtrás GLIFOSATO CONTROL MAX, aparecen sus 4 remitos, tildás todos y ponés 6,20 → los cuatro quedan con precio y desaparecen de esta lista.</p></div>
+    <div class="card"><h2>Remitos sin precio <span class="muted small">${rows.length}</span><span class="spacer"></span><label class="small"><input type="checkbox" onchange="document.querySelectorAll('.pb-chk').forEach(c=>c.checked=this.checked)"> tildar todos los visibles</label></h2>
+      <div class="tablewrap"><table class="t compact"><thead><tr><th></th><th>Insumo</th><th>Fecha</th><th>Remito</th><th>Tipo</th><th class="num">Cantidad</th><th>Depósito</th><th>Aportante</th><th>Proveedor</th><th class="num">Precio sugerido</th><th class="num">Precio USD</th><th></th></tr></thead><tbody>
+      ${rows.map(m => { const i = Store.insumo(m.insumo_id) || {}; const sug = Calc.precioSugerido(m.insumo_id).precio; return `<tr data-id="${m.id}"><td><input type="checkbox" class="pb-chk" ${f.insumo ? 'checked' : ''}></td><td><b>${esc(i.nombre)}</b> <span class="muted small">${esc(i.unidad)}</span></td><td class="nowrap">${fdate(m.fecha)}</td><td><b>${esc(m.remito || 's/n')}</b></td><td><span class="tag gray">${m.tipo}</span></td><td class="num">${fmt(m.cantidad, 2)}</td><td class="small">${esc((Store.campo(m.campo_id) || {}).nombre || '—')}</td><td>${tagAp(m.aportante)}</td><td class="small">${esc(m.proveedor || '')}</td><td class="num muted">${sug ? fmt(sug, 2) : ''}</td><td class="num"><input type="number" step="0.01" class="pb-one" placeholder="${sug || ''}"></td><td class="actions"><button class="btn xs" onclick="Tabs.stock.precioUno('${m.id}')">OK</button> <button class="btn xs" onclick="Tabs.stock.editarMov('${m.id}')">Editar</button></td></tr>`; }).join('') || '<tr><td colspan="12" class="muted">Todos los remitos tienen precio. 🎉</td></tr>'}</tbody></table></div></div>`;
+  },
+  async precioMasivo() {
+    const px = num(UI.val('pb-precio')); if (!px) return UI.toast('Poné el precio', true);
+    const ids = [...document.querySelectorAll('.pb-chk:checked')].map(c => c.closest('tr').dataset.id); if (!ids.length) return UI.toast('Tildá al menos un remito', true);
+    const fac = UI.val('pb-fac').trim(), ap = UI.val('pb-ap');
+    await UI.run(async () => { for (const id of ids) { const patch = { precio_usd: px }; if (fac) patch.factura = fac; if (ap) patch.aportante = ap; await DB.update('movimientos_stock', id, patch); } await this.reload(); App.render(); }, `Precio ${fmt(px, 2)} aplicado a ${ids.length} remito(s)`);
+  },
+  async precioUno(id) {
+    const tr = document.querySelector(`tr[data-id="${id}"]`); const px = num(tr.querySelector('.pb-one').value) || num(tr.querySelector('.pb-one').placeholder); if (!px) return UI.toast('Poné el precio', true);
+    await UI.run(async () => { await DB.update('movimientos_stock', id, { precio_usd: px }); await this.reload(); App.render(); }, 'Precio guardado');
   },
 
-  /* ---- compras / remitos ---- */
+  /* ================= CARGAR REMITO / STOCK INICIAL ================= */
   renderCompras(s) {
-    s.innerHTML = `<div class="card"><h2>Cargar movimiento</h2>
+    s.innerHTML = `<div class="card"><h2>Cargar remito / compra / stock inicial</h2>
       <div class="row"><div class="auto"><label class="f">Tipo</label><select id="mv-tipo"><option value="compra">Compra / remito</option><option value="inicial">Stock inicial</option><option value="ajuste">Ajuste (+/−)</option></select></div>
       <div class="auto"><label class="f">Fecha</label><input type="date" id="mv-fecha" value="${hoy()}"></div>
       <div class="w2"><label class="f">Insumo</label>${UI.searchbox('mv-ins', [])}<input type="hidden" id="mv-ins-id"></div>
       <div><label class="f">Cantidad</label><input type="number" step="0.01" id="mv-cant"></div>
-      <div><label class="f">Precio unit. USD</label><input type="number" step="0.01" id="mv-precio"></div></div>
-      <div class="row" style="margin-top:8px"><div><label class="f">Aportante (quién lo paga)</label><select id="mv-ap">${optsAp('GYV')}</select></div><div><label class="f">Depósito / campo</label><select id="mv-campo">${opts(S.campos, '', c => c.nombre, c => c.id, '— sin asignar —')}</select></div>
-      <div><label class="f">N° remito</label><input type="text" id="mv-rem"></div><div><label class="f">N° factura</label><input type="text" id="mv-fac"></div><div><label class="f">Proveedor</label><input type="text" id="mv-prov" placeholder="G Y V AGRO"></div></div>
+      <div><label class="f">Precio unit. USD (opcional)</label><input type="number" step="0.01" id="mv-precio"></div></div>
+      <div class="row" style="margin-top:8px"><div><label class="f">Aportante (quién lo pone)</label><select id="mv-ap">${optsAp('GYV')}</select></div><div><label class="f">Depósito / campo</label><select id="mv-campo">${opts(S.campos, '', c => c.nombre, c => c.id, '— sin asignar —')}</select></div>
+      <div><label class="f">N° remito</label><input type="text" id="mv-rem"></div><div><label class="f">N° factura</label><input type="text" id="mv-fac"></div><div><label class="f">Proveedor</label><input type="text" id="mv-prov" placeholder="GYV AGRO"></div></div>
       <div class="row" style="margin-top:8px"><div class="w3"><label class="f">Observaciones</label><input type="text" id="mv-obs"></div><div class="auto"><button class="btn primary" onclick="Tabs.stock.guardarMov()">Guardar</button></div></div>
-      <p class="muted small" style="margin-top:8px">Un remito con varios productos se carga como varias líneas (mismo N° de remito). Los insumos así cargados quedan en depósito hasta que una orden les dé salida. El precio y la factura son opcionales: se pueden completar después.</p></div>
-    <div class="card"><h2>Remitos abiertos (todavía no usados por completo)</h2>
-      <div class="row" style="margin-bottom:10px"><div><label class="f">Depósito</label><select onchange="Tabs.stock.remFiltro.deposito=this.value;App.render()">${opts(S.campos, this.remFiltro.deposito, c => c.nombre, c => c.id, 'Todos')}</select></div><div><label class="f">Aportante</label><select onchange="Tabs.stock.remFiltro.aportante=this.value;App.render()">${optsAp(this.remFiltro.aportante, 'Todos')}</select></div><div class="w2"><label class="f">Buscar (insumo, remito, proveedor)</label><input type="text" value="${esc(this.remFiltro.texto)}" onchange="Tabs.stock.remFiltro.texto=this.value;App.render()" placeholder="Enter para filtrar"></div><div class="auto"><button class="btn sm" onclick="Tabs.stock.remFiltro={deposito:'',aportante:'',texto:''};App.render()">Limpiar</button></div></div><div class="tablewrap"><table class="t compact"><thead><tr><th>Fecha</th><th>Remito</th><th>Insumo</th><th class="num">Cantidad</th><th class="num">Usado en OT</th><th class="num">Queda</th><th>Depósito</th><th>Aportante</th><th class="num">Precio USD</th><th>Factura</th><th>Proveedor</th><th></th></tr></thead><tbody>
-      ${this.remitosAbiertos().filter(m => { const rf = this.remFiltro; const i = Store.insumo(m.insumo_id) || {}; const q = rf.texto.toLowerCase(); return (!rf.deposito || m.campo_id === rf.deposito) && (!rf.aportante || m.aportante === rf.aportante) && (!q || (i.nombre || '').toLowerCase().includes(q) || (m.remito || '').toLowerCase().includes(q) || (m.proveedor || '').toLowerCase().includes(q)); }).map(m => { const i = Store.insumo(m.insumo_id) || {}; const u = this.remitoUso(m); return `<tr><td class="nowrap">${fdate(m.fecha)}</td><td><b>${esc(m.remito || 's/n')}</b> <span class="tag gray">${m.tipo}</span></td><td>${esc(i.nombre)} <span class="muted small">${esc(i.unidad)}</span></td><td class="num">${fmt(m.cantidad, 2)}</td><td class="num">${fmt(u.usada, 2)}</td><td class="num"><b>${fmt(u.restante, 2)}</b></td><td class="small">${esc((Store.campo(m.campo_id) || {}).nombre || '—')}</td><td>${tagAp(m.aportante)}</td><td class="num">${m.precio_usd ? fmt(m.precio_usd, 2) : '<span class="tag warn">s/precio</span>'}</td><td>${esc(m.factura || '') || '<span class="muted">—</span>'}</td><td class="small">${esc(m.proveedor || '')}</td><td class="actions"><button class="btn xs" onclick="Tabs.stock.editarMov('${m.id}')">Editar</button> <button class="btn xs danger" onclick="Tabs.stock.borrarMov('${m.id}')">✕</button></td></tr>`; }).join('') || '<tr><td colspan="12" class="muted">No hay remitos abiertos. Los remitos usados por completo quedan en Movimientos.</td></tr>'}</tbody></table></div>
-      <p class="muted small">"Usado en OT" suma las salidas de órdenes que se vincularon a este remito desde Pendientes. Cuando queda en cero, el remito se considera cerrado y sólo aparece en Movimientos.</p></div>`;
+      <p class="muted small" style="margin-top:8px">Un remito con varios productos se carga como varias líneas (mismo N° de remito). Suma al stock general del depósito y queda disponible para matchear con las órdenes. Si no tiene precio, aparece en “Remitos sin precio”.</p></div>
+    <div class="card"><h2>Últimos remitos cargados</h2><div class="tablewrap"><table class="t compact"><thead><tr><th>Fecha</th><th>Remito</th><th>Tipo</th><th>Insumo</th><th class="num">Cantidad</th><th class="num">Remanente</th><th>Depósito</th><th>Aportante</th><th class="num">Precio USD</th><th>Factura</th><th>Proveedor</th><th></th></tr></thead><tbody>
+      ${S.movimientos_stock.filter(m => this.esRemito(m)).sort((a, b) => (b.fecha || '').localeCompare(a.fecha || '') || (b.created_at || '').localeCompare(a.created_at || '')).slice(0, 30).map(m => { const i = Store.insumo(m.insumo_id) || {}; const u = this.remitoUso(m); return `<tr><td class="nowrap">${fdate(m.fecha)}</td><td><b>${esc(m.remito || 's/n')}</b></td><td><span class="tag gray">${m.tipo}</span></td><td>${esc(i.nombre)} <span class="muted small">${esc(i.unidad)}</span></td><td class="num">${fmt(m.cantidad, 2)}</td><td class="num">${fmt(u.restante, 2)}</td><td class="small">${esc((Store.campo(m.campo_id) || {}).nombre || '—')}</td><td>${tagAp(m.aportante)}</td><td class="num">${m.precio_usd ? fmt(m.precio_usd, 2) : '<span class="tag warn">s/precio</span>'}</td><td>${esc(m.factura || '')}</td><td class="small">${esc(m.proveedor || '')}</td><td class="actions"><button class="btn xs" onclick="Tabs.stock.editarMov('${m.id}')">Editar</button> <button class="btn xs danger" onclick="Tabs.stock.borrarMov('${m.id}')">✕</button></td></tr>`; }).join('') || '<tr><td colspan="12" class="muted">Sin remitos.</td></tr>'}</tbody></table></div></div>`;
     UI.bindSearch('mv-ins', () => S.insumos, { onPick: i => { document.getElementById('mv-ins-id').value = i.id; }, onAdd: async n => { const i = await Tabs.ordenes.nuevoInsumo(n); return i; } });
   },
   async guardarMov(editId) {
     const insId = UI.val('mv-ins-id'); const cant = num(UI.val('mv-cant'));
     if (!insId) return UI.toast('Elegí el insumo', true); if (!cant) return UI.toast('Falta la cantidad', true);
-    const row = { campania_id: S.campania.id, fecha: UI.val('mv-fecha'), tipo: UI.val('mv-tipo'), insumo_id: insId, cantidad: cant, precio_usd: num(UI.val('mv-precio')) || null, aportante: UI.val('mv-ap') || null, campo_id: UI.val('mv-campo') || null, remito: UI.val('mv-rem'), factura: UI.val('mv-fac'), proveedor: UI.val('mv-prov'), obs: UI.val('mv-obs'), facturado: true };
-    await UI.run(async () => { if (editId) { await DB.update('movimientos_stock', editId, row); UI.closeModal(); } else await DB.insert('movimientos_stock', { ...row, created_at: new Date().toISOString() }); S.movimientos_stock = await DB.select('movimientos_stock', { campania_id: S.campania.id }); App.render(); }, 'Movimiento guardado');
+    const row = { campania_id: S.campania.id, fecha: UI.val('mv-fecha'), tipo: UI.val('mv-tipo'), insumo_id: insId, cantidad: cant, precio_usd: num(UI.val('mv-precio')) || null, aportante: UI.val('mv-ap') || null, campo_id: UI.val('mv-campo') || null, remito: UI.val('mv-rem'), factura: UI.val('mv-fac'), proveedor: UI.val('mv-prov'), obs: UI.val('mv-obs') };
+    if (editId) { const mv = S.movimientos_stock.find(x => x.id === editId); if (mv && this.esRemito(mv) && cant < this.remitoUso(mv).usada - 1e-6) return UI.toast(`No podés bajar la cantidad por debajo de lo ya matcheado (${fmt(this.remitoUso(mv).usada, 2)}). Deshacé matches primero.`, true); }
+    await UI.run(async () => { if (editId) { await DB.update('movimientos_stock', editId, row); UI.closeModal(); } else await DB.insert('movimientos_stock', { ...row, created_at: new Date().toISOString() }); await this.reload(); App.render(); }, 'Movimiento guardado');
   },
   editarMov(id) {
     const mv = S.movimientos_stock.find(x => x.id === id); const i = Store.insumo(mv.insumo_id) || {};
-    UI.modal(`<h3>Editar movimiento</h3><p class="muted small">Acá se completan después el precio y la factura.</p>
+    UI.modal(`<h3>Editar movimiento</h3>
       <div class="row"><div class="auto"><label class="f">Tipo</label><select id="mv-tipo">${opts(['compra', 'inicial', 'ajuste', 'salida'], mv.tipo)}</select></div><div class="auto"><label class="f">Fecha</label><input type="date" id="mv-fecha" value="${mv.fecha || ''}"></div>
       <div class="w2"><label class="f">Insumo</label>${UI.searchbox('mv-ins', [], { value: i.nombre || '' })}<input type="hidden" id="mv-ins-id" value="${mv.insumo_id}"></div><div><label class="f">Cantidad (− sale)</label><input type="number" step="0.01" id="mv-cant" value="${mv.cantidad}"></div><div><label class="f">Precio USD</label><input type="number" step="0.01" id="mv-precio" value="${mv.precio_usd ?? ''}"></div></div>
       <div class="row" style="margin-top:8px"><div><label class="f">Aportante</label><select id="mv-ap">${optsAp(mv.aportante, '—')}</select></div><div><label class="f">Depósito / campo</label><select id="mv-campo">${opts(S.campos, mv.campo_id, c => c.nombre, c => c.id, '—')}</select></div><div><label class="f">Remito</label><input type="text" id="mv-rem" value="${esc(mv.remito || '')}"></div><div><label class="f">Factura</label><input type="text" id="mv-fac" value="${esc(mv.factura || '')}"></div><div><label class="f">Proveedor</label><input type="text" id="mv-prov" value="${esc(mv.proveedor || '')}"></div></div>
@@ -1207,29 +1320,36 @@ Tabs.stock = {
       <div class="foot"><button class="btn" onclick="UI.closeModal()">Cancelar</button><button class="btn primary" onclick="Tabs.stock.guardarMov('${id}')">Guardar</button></div>`, () => UI.bindSearch('mv-ins', () => S.insumos, { onPick: x => document.getElementById('mv-ins-id').value = x.id }));
   },
   async borrarMov(id) {
-    const mv = S.movimientos_stock.find(x => x.id === id); if (mv.orden_id && !confirm('Este movimiento es la salida de una orden de trabajo. Si lo borrás, el insumo de la orden deja de descontar stock y de costear. ¿Continuar?')) return; else if (!mv.orden_id && !confirm('¿Eliminar el movimiento?')) return;
-    await UI.run(async () => { await DB.remove('movimientos_stock', id); S.movimientos_stock = S.movimientos_stock.filter(x => x.id !== id); App.render(); }, 'Eliminado');
+    const mv = S.movimientos_stock.find(x => x.id === id); const nm = this.esRemito(mv) ? this.matchesRemito(id).length : this.matchesSalida(id).length;
+    if (mv.orden_id && !confirm('Este movimiento es la salida de una orden de trabajo. Si lo borrás, el insumo de la orden deja de descontar stock y de costear. ¿Continuar?')) return;
+    if (!mv.orden_id && !confirm(`¿Eliminar el movimiento?${nm ? ' Se deshacen ' + nm + ' match(es).' : ''}`)) return;
+    await UI.run(async () => { await DB.removeWhere('matches', this.esRemito(mv) ? { remito_mov_id: id } : { salida_mov_id: id }); await DB.remove('movimientos_stock', id); await this.reload(); App.render(); }, 'Eliminado');
   },
 
-  /* ---- stock actual ---- */
+  /* ================= STOCK ACTUAL ================= */
   renderStock(s) {
     const ins = [...new Set(S.movimientos_stock.map(m => m.insumo_id))].map(id => Store.insumo(id)).filter(Boolean).sort((a, b) => a.nombre.localeCompare(b.nombre));
-    const campos = S.campos;
-    let valor = 0;
-    const rows = ins.map(i => { const tot = Calc.stockInsumo(i.id); const px = Calc.precioSugerido(i.id).precio; const val = tot > 0 && px ? tot * px : 0; valor += val; return { i, tot, px, val, porCampo: campos.map(c => Calc.stockInsumo(i.id, c.id)), sinCampo: sum(S.movimientos_stock.filter(m => m.insumo_id === i.id && !m.campo_id), m => m.cantidad) }; });
+    const campos = S.campos; let valor = 0;
+    const rows = ins.map(i => { const tot = Calc.stockInsumo(i.id); const px = Calc.precioSugerido(i.id).precio; const val = tot > 0 && px ? tot * px : 0; valor += val; return { i, tot, px, val, porCampo: campos.map(c => Calc.stockInsumo(i.id, c.id)), sinCampo: sum(S.movimientos_stock.filter(m => m.insumo_id === i.id && !m.campo_id), m => m.cantidad), remanente: sum(this.remitosAbiertos(i.id), r => this.remitoUso(r).restante), pendOT: sum(this.salidasPendientes(i.id), x => this.salidaUso(x).pendiente) }; });
     s.innerHTML = `<div class="kpis"><div class="kpi"><div class="l">Valor del stock</div><div class="v">${usd(valor)}</div><div class="s">a último precio de compra</div></div><div class="kpi"><div class="l">Insumos con stock negativo</div><div class="v ${rows.some(r => r.tot < -1e-6) ? 'neg' : ''}">${rows.filter(r => r.tot < -1e-6).length}</div><div class="s">usados sin remito cargado</div></div></div>
-    <div class="card"><h2>Stock por insumo y depósito</h2><div class="tablewrap"><table class="t compact"><thead><tr><th>Insumo</th><th>Un.</th>${campos.map(c => `<th class="num">${esc(c.nombre)}</th>`).join('')}<th class="num">Sin dep.</th><th class="num">Total</th><th class="num">Últ. precio</th><th class="num">Valor USD</th></tr></thead><tbody>
-      ${rows.map(r => `<tr><td><b>${esc(r.i.nombre)}</b></td><td class="small">${esc(r.i.unidad)}</td>${r.porCampo.map(v => `<td class="num ${v < -1e-6 ? 'neg' : ''}">${Math.abs(v) > 1e-6 ? fmt(v, 2) : ''}</td>`).join('')}<td class="num ${r.sinCampo < -1e-6 ? 'neg' : ''}">${Math.abs(r.sinCampo) > 1e-6 ? fmt(r.sinCampo, 2) : ''}</td><td class="num"><b class="${r.tot < -1e-6 ? 'neg' : ''}">${fmt(r.tot, 2)}</b></td><td class="num">${r.px ? usd(r.px, 2) : '—'}</td><td class="num">${r.val ? usd(r.val) : ''}</td></tr>`).join('') || `<tr><td colspan="${campos.length + 6}" class="muted">Sin movimientos de stock.</td></tr>`}</tbody></table></div></div>`;
+    <div class="note info">El <b>stock general</b> es remitos (+) menos salidas de órdenes (−), por depósito. Las dos últimas columnas muestran el estado del match: remanente de remitos sin asignar y cantidad de órdenes sin matchear (si el stock está bien, deberían coincidir).</div>
+    <div class="card"><h2>Stock por insumo y depósito</h2><div class="tablewrap"><table class="t compact"><thead><tr><th>Insumo</th><th>Un.</th>${campos.map(c => `<th class="num">${esc(c.nombre)}</th>`).join('')}<th class="num">Sin dep.</th><th class="num">Total</th><th class="num">Últ. precio</th><th class="num">Valor USD</th><th class="num">Remito s/match</th><th class="num">OT s/match</th></tr></thead><tbody>
+      ${rows.map(r => `<tr><td><b>${esc(r.i.nombre)}</b></td><td class="small">${esc(r.i.unidad)}</td>${r.porCampo.map(v => `<td class="num ${v < -1e-6 ? 'neg' : ''}">${Math.abs(v) > 1e-6 ? fmt(v, 2) : ''}</td>`).join('')}<td class="num ${r.sinCampo < -1e-6 ? 'neg' : ''}">${Math.abs(r.sinCampo) > 1e-6 ? fmt(r.sinCampo, 2) : ''}</td><td class="num"><b class="${r.tot < -1e-6 ? 'neg' : ''}">${fmt(r.tot, 2)}</b></td><td class="num">${r.px ? usd(r.px, 2) : '—'}</td><td class="num">${r.val ? usd(r.val) : ''}</td><td class="num">${r.remanente > 1e-6 ? fmt(r.remanente, 2) : ''}</td><td class="num ${r.pendOT > 1e-6 ? 'neg' : ''}">${r.pendOT > 1e-6 ? fmt(r.pendOT, 2) : ''}</td></tr>`).join('') || `<tr><td colspan="${campos.length + 8}" class="muted">Sin movimientos de stock.</td></tr>`}</tbody></table></div></div>`;
   },
 
-  /* ---- movimientos ---- */
+  /* ================= MOVIMIENTOS ================= */
   renderMov(s) {
     let rows = S.movimientos_stock.slice().sort((a, b) => (b.fecha || '').localeCompare(a.fecha || '') || (b.created_at || '').localeCompare(a.created_at || ''));
     if (this.mvDep) rows = rows.filter(m => m.campo_id === this.mvDep); if (this.mvTipo) rows = rows.filter(m => m.tipo === this.mvTipo);
     if (this.mvFiltro) { const q = this.mvFiltro.toLowerCase(); rows = rows.filter(m => ((Store.insumo(m.insumo_id) || {}).nombre || '').toLowerCase().includes(q) || (m.remito || '').toLowerCase().includes(q) || (m.factura || '').toLowerCase().includes(q) || (m.proveedor || '').toLowerCase().includes(q)); }
     s.innerHTML = `<div class="card"><h2>Movimientos <span class="muted small">${rows.length}</span><span class="spacer"></span><select style="width:auto" onchange="Tabs.stock.mvDep=this.value;App.render()">${opts(S.campos, this.mvDep, c => c.nombre, c => c.id, 'Todos los depósitos')}</select><select style="width:auto" onchange="Tabs.stock.mvTipo=this.value;App.render()">${opts(['compra', 'inicial', 'salida', 'ajuste'], this.mvTipo, x => x, x => x, 'Todos los tipos')}</select><input type="text" style="width:220px" placeholder="buscar insumo / remito / factura" value="${esc(this.mvFiltro)}" onchange="Tabs.stock.mvFiltro=this.value;App.render()"></h2>
-      <div class="tablewrap"><table class="t compact"><thead><tr><th>Fecha</th><th>Tipo</th><th>Insumo</th><th class="num">Cantidad</th><th class="num">Precio USD</th><th class="num">Total USD</th><th>Aportante</th><th>Depósito</th><th>Remito</th><th>Factura</th><th>Proveedor / OT</th><th></th></tr></thead><tbody>
-      ${rows.map(m => { const i = Store.insumo(m.insumo_id) || {}; const o = m.orden_id ? Store.orden(m.orden_id) : null; return `<tr><td class="nowrap">${fdate(m.fecha)}</td><td><span class="tag ${m.tipo === 'salida' ? 'warn' : m.tipo === 'inicial' ? 'info' : 'ok'}">${m.tipo}</span>${m.tipo === 'salida' && !m.facturado ? ' <span class="tag bad">pendiente</span>' : ''}${m.facturado && m.precio_usd == null ? ' <span class="tag warn">s/precio</span>' : ''}</td><td><b>${esc(i.nombre)}</b> <span class="muted small">${esc(i.unidad)}</span></td><td class="num ${m.cantidad < 0 ? 'neg' : ''}">${fmt(m.cantidad, 2)}</td><td class="num">${m.precio_usd ? fmt(m.precio_usd, 2) : '—'}</td><td class="num">${m.precio_usd ? fmt(Math.abs(m.cantidad) * m.precio_usd) : '—'}</td><td>${tagAp(m.aportante)}</td><td class="small">${esc((Store.campo(m.campo_id) || {}).nombre || '—')}</td><td>${esc(m.remito || '')}${m.remito_mov_id ? ' <span class="tag info" title="descuenta de un remito cargado">vinc.</span>' : ''}</td><td>${esc(m.factura || '')}</td><td class="small">${o ? 'OT ' + o.numero : esc(m.proveedor || '')} ${m.obs && !o ? '<span class="muted">' + esc(m.obs) + '</span>' : ''}</td>
+      <div class="tablewrap"><table class="t compact"><thead><tr><th>Fecha</th><th>Tipo</th><th>Insumo</th><th class="num">Cantidad</th><th class="num">Precio USD</th><th class="num">Total USD</th><th>Aportante</th><th>Depósito</th><th>Remito / match</th><th>Factura</th><th>Proveedor / OT</th><th></th></tr></thead><tbody>
+      ${rows.map(m => { const i = Store.insumo(m.insumo_id) || {}; const o = m.orden_id ? Store.orden(m.orden_id) : null;
+        let matchInfo = '', precio = m.precio_usd, ap = m.aportante, estado = '';
+        if (m.tipo === 'salida') { const c = Calc.costoSalida(m); precio = c.precio_prom; ap = null; matchInfo = c.partes.filter(p => p.remito).map(p => `${fmt(p.cantidad, 1)} de rem. ${esc(p.remito.remito || 's/n')}`).join('<br>') || '<span class="muted">sin match</span>'; const u = this.salidaUso(m); estado = u.pendiente > 1e-6 ? `<span class="tag bad">${fmt(u.pendiente, 1)} s/match</span>` : ''; ap = [...new Set(c.partes.map(p => p.aportante).filter(Boolean))].map(tagAp).join(' ') || '<span class="tag bad">sin asignar</span>'; }
+        else if (this.esRemito(m)) { const u = this.remitoUso(m); matchInfo = esc(m.remito || 's/n') + (u.usada ? ` <span class="muted small">(${fmt(u.usada, 1)} matcheado)</span>` : ''); estado = !(num(m.precio_usd) > 0) ? '<span class="tag warn">s/precio</span>' : ''; ap = tagAp(m.aportante); }
+        else { matchInfo = esc(m.remito || ''); ap = tagAp(m.aportante); }
+        return `<tr><td class="nowrap">${fdate(m.fecha)}</td><td><span class="tag ${m.tipo === 'salida' ? 'warn' : m.tipo === 'inicial' ? 'info' : 'ok'}">${m.tipo}</span> ${estado}</td><td><b>${esc(i.nombre)}</b> <span class="muted small">${esc(i.unidad)}</span></td><td class="num ${m.cantidad < 0 ? 'neg' : ''}">${fmt(m.cantidad, 2)}</td><td class="num">${precio ? fmt(precio, 2) : '—'}</td><td class="num">${precio ? fmt(Math.abs(m.cantidad) * precio) : '—'}</td><td>${ap}</td><td class="small">${esc((Store.campo(m.campo_id) || {}).nombre || '—')}</td><td class="small">${matchInfo}</td><td>${esc(m.factura || '')}</td><td class="small">${o ? 'OT ' + o.numero : esc(m.proveedor || '')} ${m.obs && !o ? '<span class="muted">' + esc(m.obs) + '</span>' : ''}</td>
         <td class="actions"><button class="btn xs" onclick="Tabs.stock.editarMov('${m.id}')">Editar</button> <button class="btn xs danger" onclick="Tabs.stock.borrarMov('${m.id}')">✕</button></td></tr>`; }).join('') || '<tr><td colspan="12" class="muted">Sin movimientos.</td></tr>'}</tbody></table></div></div>`;
   },
 };
@@ -1423,7 +1543,7 @@ Tabs.dashboard = {
     this.charts.forEach(c => c.destroy()); this.charts = [];
     const L = Calc.lotesCalc(), part = L.filter(r => r.participa); const P = Calc.participacion(); const proy = S.campania.proyeccion || {};
     const tot = Calc.agrupar(part, () => 'T', () => 'T')[0] || { has: 0, alquiler: 0, insumos: 0, labores: 0, varios: 0, cosecha: 0, costo: 0, venta: 0, kg: 0 };
-    const pendStock = S.movimientos_stock.filter(x => x.tipo === 'salida' && !(num(x.precio_usd) > 0 || (x.remito_mov_id && num((S.movimientos_stock.find(r => r.id === x.remito_mov_id) || {}).precio_usd) > 0))).length, pendLab = S.labores.filter(l => !l.factura).length;
+    const pendStock = Tabs.stock.salidasPendientes().length, pendPrecio = Tabs.stock.remitosSinPrecio().length, pendLab = S.labores.filter(l => !l.factura).length;
     const rubros = ['alquiler', 'insumos', 'labores', 'varios', 'cosecha'];
     // proyección por cultivo
     const cult = CULTIVOS.map(c => { const arr = part.filter(r => r.cultivo === c); const has = sum(arr, r => r.has); const p = proy[c] || {}; const real = {}; rubros.forEach(k => real[k] = has ? sum(arr, r => r[k]) / has : 0); const pr = {}; rubros.forEach(k => pr[k] = num(p[k])); const proyTot = rubros.reduce((s, k) => s + pr[k], 0), realTot = rubros.reduce((s, k) => s + real[k], 0);
@@ -1433,7 +1553,7 @@ Tabs.dashboard = {
       <div class="kpi"><div class="l">Costo acumulado</div><div class="v">${usd(tot.costo)}</div><div class="s">${usd(tot.costo_ha)}/ha</div></div>
       <div class="kpi"><div class="l">Proyectado (agrónomo)</div><div class="v">${usd(sum(cult, x => x.proyTot * x.has))}</div><div class="s">${sum(cult, x => x.proyTot * x.has) ? pct(tot.costo / sum(cult, x => x.proyTot * x.has)) + ' ejecutado' : 'sin proyección cargada'}</div></div>
       <div class="kpi"><div class="l">Órdenes de trabajo</div><div class="v">${S.ordenes.length}</div><div class="s">${pendLab ? '<span class="neg">' + pendLab + ' labores sin factura</span>' : 'todas facturadas'}</div></div>
-      <div class="kpi"><div class="l">Insumos sin precio</div><div class="v ${pendStock ? 'neg' : 'pos'}">${pendStock}</div><div class="s">salidas de OT sin precio (Stock → Movimientos)</div></div>
+      <div class="kpi"><div class="l">OT sin match / remitos s/precio</div><div class="v ${pendStock || pendPrecio ? 'neg' : 'pos'}">${pendStock} / ${pendPrecio}</div><div class="s">salidas de OT sin remito asignado · remitos sin precio (Stock)</div></div>
       ${P.filas.map(f => `<div class="kpi"><div class="l">Participación ${f.aportante}</div><div class="v">${pct(f.pct)}</div><div class="s">pactado ${pct(f.pct_pactada, 0)} · ${usd(f.total)}</div></div>`).join('')}
     </div>
     <div class="grid2">
@@ -1495,7 +1615,9 @@ const Demo = {
       const orden = await DB.insert('ordenes', { campania_id: camp.id, numero: o.numero, fecha: o.fecha, tipo_labor: o.tipo, contratista_id: contrM.id, obs: '', estado: 'generada', created_at: new Date().toISOString() });
       const hasT = sum(o.lotes, l => l[1]);
       for (const [k, has] of o.lotes) { const ol = await DB.insert('orden_lotes', { orden_id: orden.id, lote_id: Lt[k].id, has, obs: '' }); await DB.insert('labores', { campania_id: camp.id, orden_id: orden.id, orden_lote_id: ol.id, contratista_id: contrM.id, has_reales: has, precio_ha_ars: 8160, tc: 1333, monto_usd: Math.round(has * 8160 / 1333 * 100) / 100, factura: o.numero === 12 ? '' : '3-00107', fecha: o.fecha, aportante: 'PEGSA' }); }
-      for (const [n, d] of o.ins) { const oi = await DB.insert('orden_insumos', { orden_id: orden.id, insumo_id: I[n].id, modo: 'ha', dosis: d, cantidad: d * hasT, unidad: I[n].unidad, obs: '' }); const sug = Calc.precioSugerido ? null : null; await DB.insert('movimientos_stock', { campania_id: camp.id, fecha: o.fecha, tipo: 'salida', insumo_id: I[n].id, cantidad: -d * hasT, precio_usd: o.numero === 12 ? null : { 'GLIFOSATO SIGMA': 3.95, '2,4D ETIL HEXIL': 4.8, 'DICAMBA BANVEL': 7.15, 'ACEITE METILADO SIL. V6': 13, 'GIBERELAC 10%': 170, 'ATRAZINA TRAC 90': 5.5 }[n], aportante: o.numero === 12 ? null : (n === 'ATRAZINA TRAC 90' ? 'MERZ' : 'GYV'), campo_id: Lt[o.lotes[0][0]].campo_id, orden_id: orden.id, orden_insumo_id: oi.id, facturado: o.numero !== 12, obs: 'OT N° ' + o.numero, created_at: new Date().toISOString() }); }
+      for (const [n, d] of o.ins) { const oi = await DB.insert('orden_insumos', { orden_id: orden.id, insumo_id: I[n].id, modo: 'ha', dosis: d, cantidad: d * hasT, unidad: I[n].unidad, obs: '' }); const sal = await DB.insert('movimientos_stock', { campania_id: camp.id, fecha: o.fecha, tipo: 'salida', insumo_id: I[n].id, cantidad: -d * hasT, precio_usd: null, aportante: null, campo_id: Lt[o.lotes[0][0]].campo_id, orden_id: orden.id, orden_insumo_id: oi.id, facturado: false, obs: 'OT N° ' + o.numero, created_at: new Date().toISOString() });
+        // OT 5 y 6 ya matcheadas contra los remitos de G&V; la 12 queda pendiente de match
+        if (o.numero !== 12) { const rem = (await DB.select('movimientos_stock', { campania_id: camp.id })).find(m => m.tipo === 'compra' && m.insumo_id === I[n].id); if (rem) await DB.insert('matches', { campania_id: camp.id, salida_mov_id: sal.id, remito_mov_id: rem.id, cantidad: Math.round(d * hasT * 100) / 100, created_at: new Date().toISOString() }); } }
     }
     await DB.insert('costos_varios', { campania_id: camp.id, fecha: '2025-09-01', concepto: 'HONORARIOS AGRÓNOMO', campo_id: null, lote_id: null, monto_ars: null, tc: null, monto_usd: 3000, aportante: 'MERZ', factura: '', obs: 'demo' });
     await DB.insert('produccion', { campania_id: camp.id, lote_id: Lt['EL MARTILLO/6-7-8-11-12-13-15'].id, has: 368.4, tipo: 'cosecha', kg: 1465750, estimado: false, precio_usd_tn: null, fecha: '2026-04-10', obs: '' });
@@ -1545,11 +1667,13 @@ const Exportar = {
     // 4. Labores
     add('LABORES', S.labores.map(lb => { const ol = S.orden_lotes.find(x => x.id === lb.orden_lote_id) || {}; const o = Store.orden(lb.orden_id) || {}; const l = Store.lote(ol.lote_id) || {}; return { FECHA: lb.fecha || o.fecha || '', 'NRO OT': o.numero, CAMPO: cn(l.campo_id), CULTIVO: l.cultivo || '', LOTE: l.nombre || '', 'TIPO DE OT': o.tipo_labor || '', RESPONSABLE: ctN(lb.contratista_id), 'HAS OT': r2(ol.has), 'HAS REALES': r2(lb.has_reales), '$/HA': r2(lb.precio_ha_ars), TC: r2(lb.tc), 'MONTO USD': r2(lb.monto_usd), FACTURA: lb.factura || '', 'SOCIO QUE PAGA': lb.aportante || 'SIN ASIGNAR', OBS: lb.obs || '' }; }), [11, 7, 16, 8, 10, 22, 22, 8, 10, 10, 8, 11, 10, 14, 30]);
     // 5. Stock
-    add('MOVIMIENTOS STOCK', S.movimientos_stock.slice().sort((a, b) => (a.fecha || '').localeCompare(b.fecha || '')).map(m => { const rm = m.remito_mov_id ? S.movimientos_stock.find(x => x.id === m.remito_mov_id) : null; const px = num(m.precio_usd) || (rm ? num(rm.precio_usd) : 0); return { FECHA: m.fecha || '', TIPO: m.tipo, 'NRO REMITO': m.remito || '', PROVEEDOR: m.proveedor || '', PRODUCTO: inN(m.insumo_id), CANTIDAD: r2(m.cantidad), UNIDAD: (Store.insumo(m.insumo_id) || {}).unidad || '', 'PRECIO USD/UN': px ? r2(px) : '', 'IMPORTE USD': px ? r2(Math.abs(m.cantidad) * px) : '', DEPOSITO: cn(m.campo_id), 'SOCIO QUE APORTA': m.aportante || (rm ? rm.aportante : '') || 'SIN ASIGNAR', 'NRO OT': m.orden_id ? (Store.orden(m.orden_id) || {}).numero : '', 'DESCUENTA DE REMITO': rm ? (rm.remito || '') : '', FACTURA: m.factura || '', ESTADO: m.tipo === 'salida' && !m.facturado ? 'PENDIENTE' : 'OK', OBS: m.obs || '' }; }), [11, 9, 11, 18, 28, 10, 8, 12, 12, 16, 16, 7, 16, 10, 10, 40]);
+    add('MOVIMIENTOS STOCK', S.movimientos_stock.slice().sort((a, b) => (a.fecha || '').localeCompare(b.fecha || '')).map(m => { const sal = m.tipo === 'salida'; const c = sal ? Calc.costoSalida(m) : null; const u = sal ? Tabs.stock.salidaUso(m) : Tabs.stock.remitoUso(m); const px = sal ? c.precio_prom : num(m.precio_usd); const aps = sal ? [...new Set(c.partes.map(p => p.aportante).filter(Boolean))].join('+') : (m.aportante || ''); return { FECHA: m.fecha || '', TIPO: m.tipo, 'NRO REMITO': m.remito || '', PROVEEDOR: m.proveedor || '', PRODUCTO: inN(m.insumo_id), CANTIDAD: r2(m.cantidad), UNIDAD: (Store.insumo(m.insumo_id) || {}).unidad || '', 'PRECIO USD/UN': px ? r2(px) : '', 'IMPORTE USD': px ? r2(Math.abs(m.cantidad) * px) : '', DEPOSITO: cn(m.campo_id), 'SOCIO QUE APORTA': aps || 'SIN ASIGNAR', 'NRO OT': m.orden_id ? (Store.orden(m.orden_id) || {}).numero : '', 'REMITOS MATCHEADOS': sal ? c.partes.filter(p => p.remito).map(p => `${r2(p.cantidad)} rem.${p.remito.remito || 's/n'}`).join(' · ') : '', 'SIN MATCH': sal ? r2(u.pendiente) : r2(u.restante), FACTURA: m.factura || '', ESTADO: sal ? (u.pendiente > 1e-6 ? 'PENDIENTE MATCH' : (c.estimado ? 'S/PRECIO' : 'OK')) : (num(m.precio_usd) > 0 ? 'OK' : 'S/PRECIO'), OBS: m.obs || '' }; }), [11, 9, 11, 18, 28, 10, 8, 12, 12, 16, 16, 7, 30, 10, 10, 14, 40]);
+    add('MATCHES OT-REMITO', S.matches.map(x => { const sal = S.movimientos_stock.find(m => m.id === x.salida_mov_id) || {}, r = S.movimientos_stock.find(m => m.id === x.remito_mov_id) || {}; return { 'NRO OT': (Store.orden(sal.orden_id) || {}).numero || '', 'FECHA OT': sal.fecha || '', PRODUCTO: inN(sal.insumo_id), CANTIDAD: r2(x.cantidad), 'NRO REMITO': r.remito || '', 'FECHA REMITO': r.fecha || '', DEPOSITO: cn(r.campo_id), APORTANTE: r.aportante || 'SIN ASIGNAR', 'PRECIO USD': r2(r.precio_usd), 'IMPORTE USD': num(r.precio_usd) ? r2(x.cantidad * r.precio_usd) : '', FACTURA: r.factura || '' }; }), [7, 11, 28, 10, 11, 11, 16, 10, 11, 12, 10]);
     const ins = [...new Set(S.movimientos_stock.map(m => m.insumo_id))].map(id => Store.insumo(id)).filter(Boolean).sort((a, b) => a.nombre.localeCompare(b.nombre));
     const stRows = []; ins.forEach(i => { S.campos.forEach(c => { const q = Calc.stockInsumo(i.id, c.id); if (Math.abs(q) > 1e-6) stRows.push({ DEPOSITO: c.nombre, PRODUCTO: i.nombre, CATEGORIA: i.categoria || '', STOCK: r2(q), UNIDAD: i.unidad, 'ULT. PRECIO USD': r2(Calc.precioSugerido(i.id).precio) }); }); });
     add('STOCK ACTUAL', stRows, [16, 28, 16, 10, 8, 14]);
-    add('REMITOS ABIERTOS', Tabs.stock.remitosAbiertos().map(m => { const u = Tabs.stock.remitoUso(m); return { FECHA: m.fecha || '', 'NRO REMITO': m.remito || '', TIPO: m.tipo, PRODUCTO: inN(m.insumo_id), CANTIDAD: r2(m.cantidad), 'USADO EN OT': r2(u.usada), QUEDA: r2(u.restante), DEPOSITO: cn(m.campo_id), APORTANTE: m.aportante || '', 'PRECIO USD': r2(m.precio_usd), FACTURA: m.factura || '', PROVEEDOR: m.proveedor || '' }; }), [11, 11, 9, 28, 10, 11, 10, 16, 10, 11, 10, 18]);
+    add('REMITOS SIN MATCH', Tabs.stock.remitosAbiertos().map(m => { const u = Tabs.stock.remitoUso(m); return { FECHA: m.fecha || '', 'NRO REMITO': m.remito || '', TIPO: m.tipo, PRODUCTO: inN(m.insumo_id), CANTIDAD: r2(m.cantidad), 'MATCHEADO EN OT': r2(u.usada), 'QUEDA S/MATCH': r2(u.restante), DEPOSITO: cn(m.campo_id), APORTANTE: m.aportante || '', 'PRECIO USD': r2(m.precio_usd), FACTURA: m.factura || '', PROVEEDOR: m.proveedor || '' }; }), [11, 11, 9, 28, 10, 11, 10, 16, 10, 11, 10, 18]);
+    add('OT SIN MATCH', Tabs.stock.salidasPendientes().map(m => { const u = Tabs.stock.salidaUso(m); return { 'NRO OT': (Store.orden(m.orden_id) || {}).numero || '', FECHA: m.fecha || '', PRODUCTO: inN(m.insumo_id), 'CANTIDAD OT': r2(u.usado), 'CON REMITO': r2(u.asignado), 'SIN REMITO': r2(u.pendiente), DEPOSITO: cn(m.campo_id) }; }), [7, 11, 28, 11, 11, 11, 16]);
     add('INSUMOS (catalogo)', S.insumos.map(i => ({ PRODUCTO: i.nombre, UNIDAD: i.unidad, CATEGORIA: i.categoria || '' })), [32, 8, 22]);
     // 6. Costos varios, producción, cosecha
     add('COSTOS VARIOS', S.costos_varios.map(c => ({ FECHA: c.fecha || '', CONCEPTO: c.concepto, CAMPO: c.campo_id ? cn(c.campo_id) : 'TODA LA AGRICULTURA', LOTE: c.lote_id ? (Store.lote(c.lote_id) || {}).nombre : '', 'MONTO $': r2(c.monto_ars), TC: r2(c.tc), 'MONTO USD': r2(c.monto_usd), 'SOCIO QUE PAGA': c.aportante || '', FACTURA: c.factura || '', OBS: c.obs || '' })), [11, 28, 20, 10, 12, 8, 11, 14, 10, 30]);
