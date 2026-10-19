@@ -1082,7 +1082,7 @@ const PDF = {
    PESTAÑA 3 — LABORES (facturación de las órdenes)
    ===================================================================== */
 Tabs.labores = {
-  filtro: { estado: 'todas', campo: '' },
+  filtro: { estado: 'todas', campo: '', cc_ap: '' },
   tcSugerido(fecha) { if (!fecha) return null; const c = S.cotizaciones.filter(x => x.fecha <= fecha && num(x.dolar_venta) > 0).pop(); return c ? num(c.dolar_venta) : null; },
   rows() {
     return S.labores.map(lb => { const ol = S.orden_lotes.find(x => x.id === lb.orden_lote_id) || {}; const o = Store.orden(lb.orden_id) || {}; const l = Store.lote(ol.lote_id) || {}; const c = Store.campo(l.campo_id) || {}; return { lb, ol, o, l, c }; })
@@ -1096,6 +1096,7 @@ Tabs.labores = {
     m.innerHTML = `<div class="kpis"><div class="kpi"><div class="l">Labores (USD)</div><div class="v">${usd(total)}</div><div class="s">${S.labores.length} líneas</div></div>
       <div class="kpi"><div class="l">Sin facturar</div><div class="v ${pend ? 'neg' : 'pos'}">${pend}</div><div class="s">líneas pendientes</div></div>
       ${APORTANTES.map(a => `<div class="kpi"><div class="l">${esc(a.id)}</div><div class="v">${usd(sum(S.labores.filter(l => l.aportante === a.id), l => l.monto_usd))}</div></div>`).join('')}</div>
+    ${this.renderCuentaCorriente()}
     <div class="note info">Cada lote de cada orden aparece como una línea. Completá <b>aplicador real, has aplicadas, precio/ha, tipo de cambio, factura y quién la paga</b>. El monto en USD se calcula (has × precio ÷ TC) o se puede escribir directo. Con “→ toda la orden” copiás precio, TC, factura y aportante al resto de los lotes de esa orden.</div>
     <div class="card"><h2>Labores <span class="spacer"></span>
       <select style="width:auto" onchange="Tabs.labores.filtro.estado=this.value;App.render()">${opts(['todas', 'pendientes', 'facturadas'], f.estado)}</select>
@@ -1113,6 +1114,24 @@ Tabs.labores = {
         <td><input type="text" style="width:120px" value="${esc(lb.obs || '')}" onchange="Tabs.labores.set('${lb.id}','obs',this.value)"></td>
         <td class="actions"><button class="btn xs" title="Copiar precio, TC, factura, aportante y aplicador a todos los lotes de la orden" onclick="Tabs.labores.aplicarOrden('${lb.id}')">→ toda la orden</button></td></tr>`; }).join('') || '<tr><td colspan="14" class="muted">No hay labores. Se generan automáticamente al crear órdenes de trabajo.</td></tr>'}
       </tbody><tfoot><tr><td colspan="6">Total</td><td class="num">${fmt(sum(rows, r => r.lb.has_reales ?? r.ol.has), 1)}</td><td></td><td></td><td class="num">${fmt(sum(rows, r => r.lb.monto_usd))}</td><td colspan="4"></td></tr></tfoot></table></div></div>`;
+  },
+  /* resumen tipo cuenta corriente: una fila por factura (aplicador + N° factura) */
+  renderCuentaCorriente() {
+    const f = this.filtro; const all = this.rows();
+    const aps = [...new Set(all.map(r => r.lb.contratista_id).filter(Boolean))].map(id => Store.contratista(id)).filter(Boolean).sort((a, b) => a.nombre.localeCompare(b.nombre));
+    let rows = all; if (f.cc_ap) rows = rows.filter(r => r.lb.contratista_id === f.cc_ap);
+    const g = {};
+    rows.filter(r => r.lb.factura).forEach(r => { const lb = r.lb; const k = (lb.contratista_id || '') + '|' + String(lb.factura).trim(); const x = g[k] = g[k] || { contratista: Store.contratista(lb.contratista_id) || {}, factura: String(lb.factura).trim(), fecha: null, ots: new Set(), campos: new Set(), has: 0, neto: 0, usd: 0, tcs: [], pagan: new Set() };
+      const fe = lb.fecha || r.o.fecha; if (fe && (!x.fecha || fe < x.fecha)) x.fecha = fe; x.ots.add(r.o.numero); x.campos.add(r.c.nombre); const has = num(lb.has_reales ?? r.ol.has); x.has += has; x.neto += has * num(lb.precio_ha_ars); x.usd += num(lb.monto_usd); if (num(lb.tc)) x.tcs.push(num(lb.tc)); if (lb.aportante) x.pagan.add(lb.aportante); });
+    const facs = Object.values(g).sort((a, b) => (a.fecha || '').localeCompare(b.fecha || '') || a.factura.localeCompare(b.factura, undefined, { numeric: true }));
+    const pend = rows.filter(r => !r.lb.factura); const pendHas = sum(pend, r => r.lb.has_reales ?? r.ol.has), pendUsd = sum(pend, r => r.lb.monto_usd);
+    const pendPorAp = {}; pend.forEach(r => { const n = (Store.contratista(r.lb.contratista_id) || {}).nombre || 'SIN APLICADOR'; pendPorAp[n] = pendPorAp[n] || { has: 0, ots: new Set() }; pendPorAp[n].has += num(r.lb.has_reales ?? r.ol.has); pendPorAp[n].ots.add(r.o.numero); });
+    return `<div class="card"><h2>Cuenta corriente de aplicadores <span class="muted small">facturas cargadas</span><span class="spacer"></span>
+      <select style="width:auto" onchange="Tabs.labores.filtro.cc_ap=this.value;App.render()">${opts(aps, f.cc_ap || '', c => c.nombre, c => c.id, 'Todos los aplicadores')}</select></h2>
+      <div class="tablewrap"><table class="t compact"><thead><tr><th>Fecha</th><th>Aplicador</th><th>Factura</th><th>OT</th><th>Campo</th><th class="num">Has</th><th class="num">$/ha</th><th class="num">Neto $</th><th class="num">TC</th><th class="num">USD</th><th>Paga</th></tr></thead><tbody>
+      ${facs.map(x => { const tc = x.tcs.length ? sum(x.tcs) / x.tcs.length : null; return `<tr><td class="nowrap">${fdate(x.fecha)}</td><td><b>${esc(x.contratista.nombre || '—')}</b></td><td><b>${esc(x.factura)}</b></td><td class="small">${[...x.ots].sort((a, b) => a - b).join(', ')}</td><td class="small">${[...x.campos].join(', ')}</td><td class="num">${fmt(x.has, 1)}</td><td class="num">${x.has ? fmt(x.neto / x.has, 2) : ''}</td><td class="num">${fmt(x.neto)}</td><td class="num">${tc ? fmt(tc, 2) : ''}</td><td class="num"><b>${fmt(x.usd)}</b></td><td>${[...x.pagan].map(tagAp).join(' ') || '<span class="tag bad">—</span>'}</td></tr>`; }).join('') || '<tr><td colspan="11" class="muted">Todavía no hay facturas cargadas.</td></tr>'}
+      </tbody><tfoot><tr><td colspan="5">Total facturado (${facs.length} factura${facs.length === 1 ? '' : 's'})</td><td class="num">${fmt(sum(facs, x => x.has), 1)}</td><td></td><td class="num">${fmt(sum(facs, x => x.neto))}</td><td></td><td class="num">${fmt(sum(facs, x => x.usd))}</td><td></td></tr>
+      <tr><td colspan="5" class="muted">Pendiente de facturar: ${Object.entries(pendPorAp).map(([n, v]) => `${esc(n)} ${fmt(v.has, 1)} ha (OT ${[...v.ots].sort((a, b) => a - b).join(', ')})`).join(' · ') || 'nada'}</td><td class="num muted">${fmt(pendHas, 1)}</td><td colspan="3"></td><td class="num muted">${pendUsd ? fmt(pendUsd) : ''}</td><td></td></tr></tfoot></table></div></div>`;
   },
   async contratista(id, sel) {
     if (sel.value !== '__nuevo') return this.set(id, 'contratista_id', sel.value);
