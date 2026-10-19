@@ -926,7 +926,7 @@ Tabs.ordenes = {
   addIns(i) { if (this.draft.insumos.some(x => x.insumo_id === i.id)) return UI.toast('Ese insumo ya está en la orden'); this.draft.insumos.push({ insumo_id: i.id, nombre: i.nombre, unidad: i.unidad, modo: 'ha', dosis: 0, cantidad: 0, obs: '', deposito_id: this.depositoDefault() }); this.renderForm(); },
   setIns(k, f, v) { this.draft.insumos[k][f] = v; this.renderForm(); },
   delIns(k) { this.draft.insumos.splice(k, 1); this.renderForm(); },
-  toggleCampo(id) { const d = this.draft; if (d.campos.includes(id)) { d.campos = d.campos.filter(x => x !== id); d.lotes = d.lotes.filter(l => Store.lote(l.lote_id).campo_id !== id); } else { d.campos.push(id); Store.lotesDe(id).forEach(l => d.lotes.push({ lote_id: l.id, has: num(l.has), obs: '' })); } this.renderForm(); },
+  toggleCampo(id) { const d = this.draft; if (d.campos.includes(id)) { d.campos = d.campos.filter(x => x !== id); d.lotes = d.lotes.filter(l => Store.lote(l.lote_id).campo_id !== id); } else { d.campos.push(id); Store.lotesDe(id).forEach(l => { if (!d.lotes.some(x => x.lote_id === l.id)) d.lotes.push({ lote_id: l.id, has: num(l.has), obs: '' }); }); } this.renderForm(); },
   toggleLote(id, on) { const d = this.draft; if (on) { if (!d.lotes.some(l => l.lote_id === id)) d.lotes.push({ lote_id: id, has: num(Store.lote(id).has), obs: '' }); } else d.lotes = d.lotes.filter(l => l.lote_id !== id); this.renderForm(); },
   setLote(id, f, v) { const l = this.draft.lotes.find(x => x.lote_id === id); if (l) l[f] = v; this.renderForm(); },
   limpiar() { this.draft = this.nuevoDraft(); this.editId = null; this.renderForm(); },
@@ -949,7 +949,9 @@ Tabs.ordenes = {
         orden = Store.orden(this.editId); await DB.update('ordenes', orden.id, base); Object.assign(orden, base);
         // lotes: mantener los existentes (con sus labores), borrar los quitados, agregar nuevos
         const exist = S.orden_lotes.filter(x => x.orden_id === orden.id);
-        for (const ol of exist) { const nd = d.lotes.find(l => l.lote_id === ol.lote_id); if (!nd) { await DB.remove('orden_lotes', ol.id); await DB.removeWhere('labores', { orden_lote_id: ol.id }); } else { await DB.update('orden_lotes', ol.id, { has: nd.has, obs: nd.obs }); } }
+        d.lotes = d.lotes.filter((l, i) => d.lotes.findIndex(x => x.lote_id === l.lote_id) === i);
+        const vistos = new Set();
+        for (const ol of exist) { const nd = vistos.has(ol.lote_id) ? null : d.lotes.find(l => l.lote_id === ol.lote_id); vistos.add(ol.lote_id); if (!nd) { await DB.remove('orden_lotes', ol.id); await DB.removeWhere('labores', { orden_lote_id: ol.id }); } else { await DB.update('orden_lotes', ol.id, { has: nd.has, obs: nd.obs }); } }
         for (const l of d.lotes) if (!exist.some(x => x.lote_id === l.lote_id)) { const ol = await DB.insert('orden_lotes', { orden_id: orden.id, lote_id: l.lote_id, has: l.has, obs: l.obs }); await DB.insert('labores', { campania_id: S.campania.id, orden_id: orden.id, orden_lote_id: ol.id, contratista_id: d.contratista_id, has_reales: l.has, fecha: d.fecha, aportante: null }); }
         const existI = S.orden_insumos.filter(x => x.orden_id === orden.id);
         for (const oi of existI) { const ni = d.insumos.find(i => i.insumo_id === oi.insumo_id); if (!ni) { for (const mv of S.movimientos_stock.filter(m => m.orden_insumo_id === oi.id)) await DB.removeWhere('matches', { salida_mov_id: mv.id }); await DB.removeWhere('movimientos_stock', { orden_insumo_id: oi.id }); await DB.remove('orden_insumos', oi.id); } else { const cant = ni.modo === 'ha' ? num(ni.dosis) * hasTot : num(ni.cantidad); await DB.update('orden_insumos', oi.id, { modo: ni.modo, dosis: ni.dosis, cantidad: cant, unidad: ni.unidad, obs: ni.obs }); const mv = S.movimientos_stock.find(m => m.orden_insumo_id === oi.id); if (mv) { await DB.update('movimientos_stock', mv.id, { cantidad: -cant, fecha: d.fecha, campo_id: ni.deposito_id || campoSalida }); await this.recortarMatches(mv.id, cant); } } }
@@ -1010,7 +1012,7 @@ Tabs.ordenes = {
     const o = Store.orden(id); const ols = S.orden_lotes.filter(x => x.orden_id === id), ois = S.orden_insumos.filter(x => x.orden_id === id); const hasTot = sum(ols, x => x.has);
     this.editId = id;
     this.draft = { numero: o.numero, fecha: o.fecha, tipo_labor: o.tipo_labor, contratista_id: o.contratista_id, contratista_nombre: (Store.contratista(o.contratista_id) || {}).nombre || '', obs: o.obs || '',
-      campos: [...new Set(ols.map(ol => (Store.lote(ol.lote_id) || {}).campo_id).filter(Boolean))], lotes: ols.map(ol => ({ lote_id: ol.lote_id, has: num(ol.has), obs: ol.obs || '' })),
+      campos: [...new Set(ols.map(ol => (Store.lote(ol.lote_id) || {}).campo_id).filter(Boolean))], lotes: ols.filter((ol, i) => ols.findIndex(x => x.lote_id === ol.lote_id) === i).map(ol => ({ lote_id: ol.lote_id, has: num(ol.has), obs: ol.obs || '' })),
       insumos: ois.map(oi => { const i = Store.insumo(oi.insumo_id) || {}; const mv = S.movimientos_stock.find(m => m.orden_insumo_id === oi.id); return { insumo_id: oi.insumo_id, nombre: i.nombre, unidad: oi.unidad || i.unidad, modo: oi.modo, dosis: num(oi.dosis), cantidad: num(oi.cantidad), obs: oi.obs || '', deposito_id: mv ? mv.campo_id : '' }; }) };
     this.renderForm(); window.scrollTo(0, 0);
   },
