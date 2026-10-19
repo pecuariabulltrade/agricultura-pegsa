@@ -1200,7 +1200,7 @@ Tabs.stock = {
   /* --- modal por orden: asignar remitos a una salida --- */
   matchOrden(salId) {
     const sal = S.movimientos_stock.find(m => m.id === salId); const u = this.salidaUso(sal); const i = Store.insumo(sal.insumo_id) || {}; const rems = this.remitosAbiertos(sal.insumo_id);
-    UI.modal(`<h3>Match · ${esc(this.salLabel(sal))}</h3><p><b>${esc(i.nombre)}</b> · usado ${fmt(u.usado, 2)} ${esc(i.unidad)} · ya asignado ${fmt(u.asignado, 2)} · <b class="neg">pendiente ${fmt(u.pendiente, 2)}</b></p>
+    UI.modal(`<h3>Match · ${esc(this.salLabel(sal))}</h3><p><b>${esc(i.nombre)}</b> · usado en la OT <input type="number" step="0.01" id="mt-usado" value="${+u.usado.toFixed(2)}" style="width:110px;display:inline-block" oninput="Tabs.stock.mtUsado(${u.asignado})"> ${esc(i.unidad)} · ya asignado ${fmt(u.asignado, 2)} · <b class="neg">pendiente <span id="mt-pend">${fmt(u.pendiente, 2)}</span></b> <span class="muted small">(si el remito dice otra cantidad, corregí acá el usado y la OT se ajusta al guardar)</span></p>
       ${rems.length ? `<div class="btn-group" style="margin-bottom:8px"><button class="btn sm" onclick="Tabs.stock.fifo(${u.pendiente})">Repartir FIFO (más viejo primero)</button><button class="btn sm" onclick="document.querySelectorAll('.mt-q').forEach(e=>e.value='')">Limpiar</button></div>
       <div class="tablewrap"><table class="t compact"><thead><tr><th>Remito</th><th>Fecha</th><th>Depósito</th><th>Aportante</th><th class="num">Precio</th><th class="num">Remanente</th><th class="num">Asignar</th></tr></thead><tbody>
       ${rems.map(r => `<tr data-rem="${r.id}" data-rest="${this.remitoUso(r).restante}"><td><b>${esc(r.remito || 's/n')}</b> <span class="tag gray">${r.tipo}</span></td><td class="nowrap">${fdate(r.fecha)}</td><td class="small">${esc((Store.campo(r.campo_id) || {}).nombre || '—')}</td><td>${tagAp(r.aportante)}</td><td class="num">${r.precio_usd ? fmt(r.precio_usd, 2) : '<span class="tag warn">s/p</span>'}</td><td class="num">${fmt(this.remitoUso(r).restante, 2)}</td><td class="num"><input type="number" step="0.01" class="mt-q" min="0" oninput="Tabs.stock.mtTotal()"></td></tr>`).join('')}</tbody>
@@ -1215,8 +1215,18 @@ Tabs.stock = {
     document.querySelectorAll(`tr[data-${attr}]`).forEach(tr => { const q = num(tr.querySelector('.mt-q').value); if (q > 1e-9) { if (q > num(tr.dataset.rest) + 1e-6) err = 'Una asignación supera el remanente disponible'; out.push({ id: tr.dataset[attr], q }); } });
     return { out, err };
   },
+  mtUsado(asignado) { const v = num(UI.val('mt-usado')); const el = document.getElementById('mt-pend'); if (el) el.textContent = fmt(Math.max(0, v - asignado), 2); const tr = document.querySelectorAll('tr[data-rem]'); if (tr.length) { const b = document.querySelector('button[onclick^="Tabs.stock.fifo("]'); if (b) b.setAttribute('onclick', `Tabs.stock.fifo(${Math.max(0, v - asignado)})`); } },
   async guardarMatchOrden(salId) {
-    const sal = S.movimientos_stock.find(m => m.id === salId); const u = this.salidaUso(sal);
+    const sal = S.movimientos_stock.find(m => m.id === salId);
+    // si se corrigió el "usado" (lo que dice el remito), se ajusta la OT y la salida antes de matchear
+    const nuevoUsado = num(UI.val('mt-usado'));
+    if (document.getElementById('mt-usado') && Math.abs(nuevoUsado - (-num(sal.cantidad))) > 1e-6) {
+      if (nuevoUsado <= 0) return UI.toast('El usado tiene que ser mayor a 0', true);
+      const ya = this.salidaUso(sal).asignado; if (nuevoUsado < ya - 1e-6) return UI.toast(`Ya hay ${fmt(ya, 2)} matcheados: no podés bajar el usado por debajo de eso (deshacé matches primero)`, true);
+      await DB.update('movimientos_stock', sal.id, { cantidad: -nuevoUsado }); sal.cantidad = -nuevoUsado;
+      if (sal.orden_insumo_id) { const oi = S.orden_insumos.find(x => x.id === sal.orden_insumo_id); if (oi) { const hasT = Calc.ordenHas(oi.orden_id); await DB.update('orden_insumos', oi.id, { cantidad: nuevoUsado, modo: 'total', dosis: hasT ? nuevoUsado / hasT : 0 }); oi.cantidad = nuevoUsado; oi.modo = 'total'; oi.dosis = hasT ? nuevoUsado / hasT : 0; } }
+    }
+    const u = this.salidaUso(sal);
     const { out, err } = this.leerAsignaciones('rem'); if (err) return UI.toast(err, true); if (!out.length) return UI.toast('No asignaste cantidades', true);
     const total = sum(out, x => x.q);
     if (total > u.pendiente + 1e-6) return UI.toast(`Asignaste ${fmt(total, 2)} pero la orden sólo tiene ${fmt(u.pendiente, 2)} pendiente`, true);
