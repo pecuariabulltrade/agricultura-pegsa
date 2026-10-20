@@ -1620,6 +1620,7 @@ Tabs.dashboard = {
     <div class="card"><h2>Proyección del agrónomo <span class="spacer"></span><button class="btn sm" onclick="Tabs.dashboard.proyForm()">Editar proyección</button></h2>
       ${Object.keys(proy).length ? `<div class="tablewrap"><table class="t compact"><thead><tr><th>Cultivo</th><th>Rubro</th><th class="num">Proyectado USD/ha</th><th class="num">Real USD/ha</th><th class="num">% ejecutado</th><th class="num">Desvío USD/ha</th><th class="num">Desvío total USD</th><th>Avance</th></tr></thead><tbody>
       ${cult.map(x => rubros.map((k, i) => { const ej = x.pr[k] ? x.real[k] / x.pr[k] : null; return `<tr>${i === 0 ? `<td rowspan="6"><b>${x.c}</b><div class="muted small">${fmt(x.has, 1)} ha</div></td>` : ''}<td>${k}</td><td class="num">${fmt(x.pr[k])}</td><td class="num">${fmt(x.real[k])}</td><td class="num">${pct(ej, 0)}</td><td class="num ${x.real[k] - x.pr[k] > 0 ? 'neg' : ''}">${x.pr[k] ? (x.real[k] - x.pr[k] > 0 ? '+' : '') + fmt(x.real[k] - x.pr[k]) : ''}</td><td class="num ${x.real[k] - x.pr[k] > 0 ? 'neg' : ''}">${x.pr[k] ? (x.real[k] - x.pr[k] > 0 ? '+' : '') + fmt((x.real[k] - x.pr[k]) * x.has) : ''}</td><td style="min-width:120px"><div class="bar"><i class="${ej > 1 ? 'over' : ''}" style="width:${Math.min(100, (ej || 0) * 100)}%"></i></div></td></tr>`; }).join('') + `<tr class="group"><td>Total</td><td class="num">${fmt(x.proyTot)}</td><td class="num">${fmt(x.realTot)}</td><td class="num">${pct(x.proyTot ? x.realTot / x.proyTot : null, 0)}</td><td class="num ${x.realTot - x.proyTot > 0 ? 'neg' : ''}">${x.proyTot ? (x.realTot - x.proyTot > 0 ? '+' : '') + fmt(x.realTot - x.proyTot) : ''}</td><td class="num ${x.realTot - x.proyTot > 0 ? 'neg' : ''}">${x.proyTot ? (x.realTot - x.proyTot > 0 ? '+' : '') + fmt((x.realTot - x.proyTot) * x.has) : ''}</td><td class="small muted">rinde esp. ${fmt(x.rinde, 1)} qq/ha · precio ${usd(x.precio)}/tn → resultado proy. ${usd(x.resP)}/ha${x.realRinde ? ' · rinde real ' + fmt(x.realRinde, 1) : ''}</td></tr>`).join('')}</tbody></table></div>` : '<p class="muted">Todavía no se cargó la proyección. Cargá los costos esperados por hectárea, el rinde y el precio de cada cultivo para ver el avance y el desvío.</p>'}</div>`;
+    m.insertAdjacentHTML('beforeend', this.renderPresupuestos());
     // charts
     const colors = { alquiler: '#2f6b3a', insumos: '#2c5f8a', labores: '#b7791f', varios: '#7a6f9b', cosecha: '#8a4b2c' };
     const apColor = { PEGSA: '#2f6b3a', GYV: '#2c5f8a', MERZ: '#b7791f' };
@@ -1635,7 +1636,53 @@ Tabs.dashboard = {
     UI.modal(`<h3>Proyección del agrónomo (USD por hectárea)</h3><div class="grid2">${CULTIVOS.map(c => { const p = proy[c] || {}; return `<div><h4>${c}</h4>${rubros.map(k => `<label class="f">${k} USD/ha</label><input type="number" step="0.01" id="py-${c}-${k}" value="${p[k] ?? ''}">`).join('')}<label class="f">Rinde esperado qq/ha</label><input type="number" step="0.1" id="py-${c}-rinde_qq" value="${p.rinde_qq ?? ''}"><label class="f">Precio esperado USD/tn</label><input type="number" step="0.01" id="py-${c}-precio_usd_tn" value="${p.precio_usd_tn ?? ''}"></div>`; }).join('')}</div>
       <div class="foot"><button class="btn" onclick="UI.closeModal()">Cancelar</button><button class="btn primary" onclick="Tabs.dashboard.proySave()">Guardar</button></div>`);
   },
-  async proySave() { const P = {}; CULTIVOS.forEach(c => { P[c] = {}; ['alquiler', 'insumos', 'labores', 'varios', 'cosecha', 'rinde_qq', 'precio_usd_tn'].forEach(k => P[c][k] = num(UI.val(`py-${c}-${k}`))); }); await UI.run(async () => { await Store.saveCampania({ proyeccion: P }); UI.closeModal(); App.render(); }, 'Proyección guardada'); },
+  async proySave() { const P = {}; CULTIVOS.forEach(c => { P[c] = {}; ['alquiler', 'insumos', 'labores', 'varios', 'cosecha', 'rinde_qq', 'precio_usd_tn'].forEach(k => P[c][k] = num(UI.val(`py-${c}-${k}`))); }); P.presupuestos = (S.campania.proyeccion || {}).presupuestos || {}; await UI.run(async () => { await Store.saveCampania({ proyeccion: P }); UI.closeModal(); App.render(); }, 'Proyección guardada'); },
+  /* ================= PRESUPUESTO POR CAMPO (del asesor) vs. ejecutado real ================= */
+  rubroReal(insumo) { const n = ((insumo || {}).nombre || '').toUpperCase(), c = ((insumo || {}).categoria || '').toUpperCase(); if (/SEMILLA/.test(n) || /SEMILLA/.test(c)) return 'Semillas'; if (/FERTIL|MICROGRAN|UREA|MICROSTAR|ARRANCADOR|SPS/.test(n) || /FERTIL/.test(c)) return 'Fertilizantes'; return 'Agroquímicos'; },
+  presuReal(campoId, B) {
+    const lotes = Store.lotesDe(campoId); const grupoDe = l => (B.grupos.find(g => g.lotes.includes(String(l.nombre))) || {}).id || 'OTROS';
+    const acc = { mes: {}, grupo: {}, rubro: {}, total: 0, labSinFactura: 0, labSinFacturaHas: 0, insEstimado: 0 };
+    const add = (mes, g, r, v) => { if (!v) return; acc.total += v; acc.mes[mes] = (acc.mes[mes] || 0) + v; acc.grupo[g] = (acc.grupo[g] || 0) + v; acc.rubro[r] = (acc.rubro[r] || 0) + v; };
+    S.ordenes.forEach(o => { const ols = S.orden_lotes.filter(x => x.orden_id === o.id); const hasO = sum(ols, x => x.has); if (!hasO) return; const mios = ols.filter(ol => lotes.some(l => l.id === ol.lote_id)); if (!mios.length) return;
+      const ins = Calc.costoInsumosOrden(o.id); const mes = (o.fecha || '').slice(0, 7);
+      mios.forEach(ol => { const l = Store.lote(ol.lote_id); const g = grupoDe(l); const f = num(ol.has) / hasO; ins.forEach(i => { add(mes, g, this.rubroReal(Store.insumo(i.oi.insumo_id)), i.usd * f); if (i.estimado) acc.insEstimado += i.usd * f; }); });
+    });
+    S.labores.forEach(lb => { const ol = S.orden_lotes.find(x => x.id === lb.orden_lote_id); if (!ol) return; const l = Store.lote(ol.lote_id); if (!l || l.campo_id !== campoId) return; const o = Store.orden(lb.orden_id) || {}; const mes = (lb.fecha || o.fecha || '').slice(0, 7);
+      if (num(lb.monto_usd)) add(mes, grupoDe(l), 'Labores', num(lb.monto_usd)); else { acc.labSinFactura++; acc.labSinFacturaHas += num(lb.has_reales ?? ol.has); } });
+    return acc;
+  },
+  renderPresupuestos() {
+    const PR = (S.campania.proyeccion || {}).presupuestos || {}; const ids = Object.keys(PR); if (!ids.length) return '';
+    const mesHoy = hoy().slice(0, 7);
+    return ids.map(cid => { const B = PR[cid], campo = Store.campo(cid) || { nombre: '?' }; const R = this.presuReal(cid, B);
+      const meses = B.meses.slice().sort((a, b) => a.mes.localeCompare(b.mes)); const mesesReal = Object.keys(R.mes).filter(m => !meses.some(x => x.mes === m)).sort(); const todos = [...meses.map(x => x.mes), ...mesesReal].sort();
+      const presHasta = sum(meses.filter(x => x.mes <= mesHoy), x => x.total); let accP = 0, accR = 0;
+      const open = this.presuOpen === cid;
+      const agrupR = { Fertilizantes: 'Fertilizantes', Herbicidas: 'Agroquímicos', Fungicidas: 'Agroquímicos', Coadyuvantes: 'Agroquímicos', Insecticidas: 'Agroquímicos', Semillas: 'Semillas', Labores: 'Labores' };
+      const rubG = {}; B.rubros.forEach(r => { const k = agrupR[r.rubro] || r.rubro; rubG[k] = (rubG[k] || 0) + num(r.total); });
+      const dev = (r, p) => p ? `<span class="${r - p > 0 ? 'neg' : 'pos'}">${r - p > 0 ? '+' : ''}${fmt(r - p)}</span>` : (r ? fmt(r) : '');
+      return `<div class="card"><h2>Presupuesto ${esc(campo.nombre)} <span class="muted small">${esc(B.fuente || '')} · ${fdate(B.fecha)} · ${fmt(B.has, 0)} ha</span><span class="spacer"></span><button class="btn sm" onclick="Tabs.dashboard.presuOpen=${open ? 'null' : `'${cid}'`};App.render()">${open ? 'Ocultar detalle' : 'Ver detalle de insumos'}</button> <button class="btn sm danger" onclick="Tabs.dashboard.presuQuitar('${cid}')">Quitar</button></h2>
+      <div class="kpis">
+        <div class="kpi"><div class="l">Presupuesto campaña</div><div class="v">${usd(B.total_usd)}</div><div class="s">${usd(B.total_usd / B.has)}/ha · insumos + labores</div></div>
+        <div class="kpi"><div class="l">Ejecutado real (portal)</div><div class="v">${usd(R.total)}</div><div class="s">${pct(R.total / B.total_usd, 0)} del presupuesto · ${usd(R.total / B.has)}/ha</div></div>
+        <div class="kpi"><div class="l">Pendiente de ejecutar</div><div class="v">${usd(Math.max(0, B.total_usd - R.total))}</div><div class="s">según presupuesto</div></div>
+      </div>
+      ${R.labSinFactura || R.insEstimado ? `<div class="note" style="margin-top:8px">${R.labSinFactura ? `Hay <b>${R.labSinFactura}</b> línea(s) de labores sin factura (${fmt(R.labSinFacturaHas, 0)} ha) que todavía no suman al real. ` : ''}${R.insEstimado ? `Insumos estimados (sin remito/precio): ${usd(R.insEstimado)}.` : ''}</div>` : ''}
+      <div class="grid2" style="margin-top:10px">
+        <div><h4>Por cultivo</h4><div class="tablewrap"><table class="t compact"><thead><tr><th>Cultivo</th><th>Lotes</th><th class="num">Has</th><th class="num">Presup. USD/ha</th><th class="num">Presupuesto</th><th class="num">Real</th><th class="num">Real USD/ha</th><th class="num">% ejec.</th></tr></thead><tbody>
+        ${B.grupos.map(g => { const r = R.grupo[g.id] || 0; return `<tr><td><b>${esc(g.nombre)}</b></td><td class="small">${g.lotes.join(', ')}</td><td class="num">${fmt(g.has, 0)}</td><td class="num">${fmt(g.total_ha)}</td><td class="num">${fmt(g.total)}</td><td class="num">${fmt(r)}</td><td class="num">${fmt(g.has ? r / g.has : 0)}</td><td class="num">${pct(g.total ? r / g.total : null, 0)}</td></tr>`; }).join('')}
+        ${R.grupo.OTROS ? `<tr><td>Otros lotes</td><td></td><td></td><td></td><td></td><td class="num">${fmt(R.grupo.OTROS)}</td><td></td><td></td></tr>` : ''}
+        </tbody></table></div></div>
+        <div><h4>Por rubro</h4><div class="tablewrap"><table class="t compact"><thead><tr><th>Rubro</th><th class="num">Presupuesto</th><th class="num">Real</th><th class="num">% ejec.</th><th class="num">Desvío</th></tr></thead><tbody>
+        ${Object.entries(rubG).map(([k, p]) => { const r = R.rubro[k] || 0; return `<tr><td>${k}${k === 'Agroquímicos' ? ' <span class="muted small">(herbicidas, fungicidas, insecticidas, coadyuvantes)</span>' : ''}</td><td class="num">${fmt(p)}</td><td class="num">${fmt(r)}</td><td class="num">${pct(p ? r / p : null, 0)}</td><td class="num">${r > p ? `<span class="neg">+${fmt(r - p)}</span>` : ''}</td></tr>`; }).join('')}
+        </tbody></table></div></div>
+      </div>
+      ${open ? `<h4 style="margin-top:12px">Detalle del presupuesto por mes</h4><div class="tablewrap"><table class="t compact"><thead><tr><th>Mes</th><th>Insumo / labor</th><th>Rubro</th><th>Cultivo</th><th class="num">Cantidad</th><th>Un.</th><th class="num">Precio USD</th><th class="num">Total USD</th></tr></thead><tbody>
+        ${B.items.map(it => `<tr><td class="nowrap">${mesLabel(it[0])}</td><td>${esc(it[1])}</td><td class="small">${esc(it[2])}</td><td class="small">${it[3].map(g => (B.grupos.find(x => x.id === g) || {}).nombre || g).join(', ')}</td><td class="num">${fmt(it[4], 1)}</td><td>${esc(it[5])}</td><td class="num">${fmt(it[6], 2)}</td><td class="num">${fmt(it[7])}</td></tr>`).join('')}
+        </tbody></table></div>` : ''}
+      <p class="muted small" style="margin-top:8px">Real = insumos de las OT (a precio de remito matcheado o estimado) + labores con monto, de los lotes de ${esc(campo.nombre)}. El presupuesto no incluye cosecha, alquiler ni gastos de comercialización.</p></div>`; }).join('');
+  },
+  async presuQuitar(cid) { if (!confirm('¿Quitar el presupuesto cargado de este campo?')) return; const P = { ...(S.campania.proyeccion || {}) }; P.presupuestos = { ...(P.presupuestos || {}) }; delete P.presupuestos[cid]; await UI.run(async () => { await Store.saveCampania({ proyeccion: P }); App.render(); }, 'Presupuesto quitado'); },
 };
 
 /* =====================================================================
