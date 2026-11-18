@@ -104,6 +104,7 @@ table.t.compact td,table.t.compact th{padding:4px 6px}
 .tag.gray{background:#eceee9;color:var(--muted)}
 .tag.PEGSA{background:var(--green-2);color:var(--pegsa)}
 .tag.GYV{background:var(--blue-2);color:var(--gyv)}
+.tag.YULTO{background:#fde8d7;color:#8a4b2c}
 .tag.MERZ{background:var(--amber-2);color:var(--merz)}
 
 /* ---- KPI ---- */
@@ -173,9 +174,12 @@ details summary{cursor:pointer;font-weight:600;color:var(--muted);padding:4px 0}
   <span id="modebadge">modo local</span>
   <button class="btn sm" id="btn-refresh" onclick="App.refrescar()" title="Volver a leer los datos de la base (lo que cargaron los otros usuarios)">↻ Refrescar</button>
   <button class="btn sm" onclick="Exportar.excel()" title="Descargar toda la información de la campaña en un Excel">⬇ Excel</button>
+  <select id="sel-sociedad" class="hidden" onchange="App.setSociedad(this.value)" title="Sociedad / negocio"></select>
   <select id="sel-campania" onchange="App.setCampania(this.value)"></select>
   <button class="btn sm" onclick="Campanias.nueva()" title="Nueva campaña">+ Campaña</button>
   <button class="btn sm" onclick="Campanias.editar()" title="Configurar campaña">⚙</button>
+  <button class="btn sm hidden" id="btn-sociedades" onclick="Sociedades.editar()" title="Sociedades: nombre y aportantes">Sociedades</button>
+  <button class="btn sm hidden" id="btn-usuarios" onclick="Usuarios.editar()" title="Qué sociedades y campos ve cada usuario">Usuarios</button>
   <button class="btn sm" id="btn-logout" onclick="Auth.logout()">Salir</button>
 </div>
 <div id="tabs"></div>
@@ -198,17 +202,19 @@ const CONFIG = {
   DOLAR_API: 'https://dolarapi.com/v1/dolares/oficial',
 };
 
-const APORTANTES = [
+const APORTANTES_DEFAULT = [
   { id: 'PEGSA', nombre: 'Pecuaria El Garabí' },
   { id: 'GYV',   nombre: 'GVM (G&V Agro)' },
   { id: 'MERZ',  nombre: 'Merz' },
 ];
-const CULTIVOS = ['SOJA', 'MAIZ'];
+let APORTANTES = APORTANTES_DEFAULT.slice();   // se reemplaza por los aportantes de la sociedad elegida
+const ADMINS = ['mobilia_nicolas@hotmail.com', 'mobilianicolasariel@gmail.com', 'haras@live.com.ar'];   // ven y configuran todas las sociedades
+const CULTIVOS = ['SOJA', 'MAIZ', 'SORGO', 'CENTENO'];
 const CICLOS = ['PRIMERA', 'SEGUNDA'];
 const UNIDADES = ['lt', 'kg', 'g', 'bolsa', 'big bag', 'tn', 'un'];
 const CATEGORIAS = ['HERBICIDA', 'INSECTICIDA', 'FUNGICIDA', 'COADYUVANTE', 'REGULADOR DE CRECIMIENTO', 'SEMILLA', 'MICROGRANULADO', 'FERTILIZANTE', 'UREA', 'FERT. FOLIAR/ARRANCADOR', 'OTROS'];
 const TABLAS_CAMPANIA = ['campos','lotes','precios_mes','ordenes','labores','movimientos_stock','costos_varios','produccion','cosechas','matches'];
-const TABLAS_GLOBAL = ['campanias','cotizaciones','insumos','contratistas','tipos_labor'];
+const TABLAS_GLOBAL = ['sociedades','permisos','campanias','cotizaciones','insumos','contratistas','tipos_labor'];
 const TABLAS_HIJAS = { orden_lotes: 'ordenes', orden_insumos: 'ordenes' };
 
 /* ---------------- utilidades ---------------- */
@@ -328,18 +334,34 @@ const Auth = {
 };
 
 /* ---------------- estado en memoria ---------------- */
-const S = { campanias: [], campania: null, cotizaciones: [], insumos: [], contratistas: [], tipos_labor: [],
+const S = { sociedades: [], permisos: [], sociedad: null, campanias: [], campania: null, cotizaciones: [], insumos: [], contratistas: [], tipos_labor: [],
   campos: [], lotes: [], precios_mes: [], ordenes: [], orden_lotes: [], orden_insumos: [], labores: [],
   movimientos_stock: [], matches: [], costos_varios: [], produccion: [], cosechas: [] };
 
 const Store = {
   async loadGlobal() {
-    for (const t of TABLAS_GLOBAL) S[t] = await DB.select(t);
+    for (const t of TABLAS_GLOBAL) { try { S[t] = await DB.select(t); } catch (e) { if (t === 'sociedades' || t === 'permisos') { S[t] = []; console.warn('tabla ' + t + ' no existe todavía'); } else throw e; } }
     S.campanias.sort((a, b) => (a.created_at || '').localeCompare(b.created_at || ''));
     S.insumos.sort((a, b) => a.nombre.localeCompare(b.nombre));
     S.contratistas.sort((a, b) => a.nombre.localeCompare(b.nombre));
     S.cotizaciones.sort((a, b) => a.fecha.localeCompare(b.fecha));
+    S.sociedades.sort((a, b) => (a.created_at || '').localeCompare(b.created_at || ''));
   },
+  esAdmin() { const e = ((Auth.user || {}).email || '').toLowerCase(); return DB.mode === 'local' || ADMINS.includes(e); },
+  // sociedades que puede ver el usuario logueado: las que lo listan en "usuarios" (o todas, si es admin; o las que no restringen a nadie)
+  email() { return ((Auth.user || {}).email || '').toLowerCase().trim(); },
+  permisosDe(email) { const e = (email || this.email()); return S.permisos.filter(p => String(p.email || '').toLowerCase().trim() === e); },
+  // sociedades que puede ver el usuario: admins todas; el resto, las que tengan un permiso cargado por el administrador
+  sociedadesVisibles() { const perms = this.permisosDe(); return S.sociedades.filter(x => x.activa !== false && (this.esAdmin() || perms.some(p => p.sociedad_id === x.id))); },
+  // campos permitidos en la sociedad activa: null = todos; array de nombres = sólo esos
+  camposPermitidos() { if (this.esAdmin() || !S.sociedad) return null; const p = this.permisosDe().find(x => x.sociedad_id === S.sociedad.id); if (!p || !p.campos || !p.campos.length) return null; return p.campos.map(n => String(n).toUpperCase().trim()); },
+  setSociedad(id) {
+    S.sociedad = S.sociedades.find(x => x.id === id) || null;
+    APORTANTES = S.sociedad && (S.sociedad.aportantes || []).length ? S.sociedad.aportantes.map(a => ({ id: String(a.id).toUpperCase(), nombre: a.nombre || a.id })) : APORTANTES_DEFAULT.slice();
+    const b = document.querySelector('#topbar .brand span'); if (b) b.textContent = S.sociedad ? (S.sociedad.corto || S.sociedad.nombre) : 'PEGSA · G&V · Merz';
+    if (S.sociedad) localStorage.setItem('agri_sociedad', S.sociedad.id);
+  },
+  campaniasDeSociedad() { const legacy = S.sociedades.length ? S.sociedades[0].id : null; if (!S.sociedad && S.sociedades.length) return []; return S.campanias.filter(c => S.sociedad ? (c.sociedad_id === S.sociedad.id || (!c.sociedad_id && S.sociedad.id === legacy)) : true); },
   async loadCampania(id) {
     S.campania = S.campanias.find(c => c.id === id) || null;
     if (!S.campania) { TABLAS_CAMPANIA.forEach(t => S[t] = []); S.orden_lotes = []; S.orden_insumos = []; return; }
@@ -347,8 +369,23 @@ const Store = {
     const ids = S.ordenes.map(o => o.id);
     S.orden_lotes = ids.length ? await DB.select('orden_lotes', { orden_id: ids }) : [];
     S.orden_insumos = ids.length ? await DB.select('orden_insumos', { orden_id: ids }) : [];
+    this.aplicarPermisos();
     S.campos.sort((a, b) => a.nombre.localeCompare(b.nombre));
     S.ordenes.sort((a, b) => (b.numero - a.numero) || ((a.alterna ? 1 : 0) - (b.alterna ? 1 : 0)) || String(a.sufijo || '').localeCompare(String(b.sufijo || '')));
+  },
+  // si el usuario sólo puede ver algunos campos, se recorta todo lo cargado a esos campos
+  aplicarPermisos() {
+    const perm = this.camposPermitidos(); S.restringido = null; if (!perm) return;
+    S.campos = S.campos.filter(c => perm.includes(String(c.nombre).toUpperCase().trim())); const cIds = new Set(S.campos.map(c => c.id));
+    S.lotes = S.lotes.filter(l => cIds.has(l.campo_id)); const lIds = new Set(S.lotes.map(l => l.id));
+    const oKeep = new Set(S.orden_lotes.filter(ol => lIds.has(ol.lote_id)).map(ol => ol.orden_id));
+    S.ordenes = S.ordenes.filter(o => oKeep.has(o.id)); S.orden_lotes = S.orden_lotes.filter(ol => oKeep.has(ol.orden_id) && lIds.has(ol.lote_id)); S.orden_insumos = S.orden_insumos.filter(oi => oKeep.has(oi.orden_id));
+    const olIds = new Set(S.orden_lotes.map(ol => ol.id)); S.labores = S.labores.filter(lb => olIds.has(lb.orden_lote_id));
+    S.movimientos_stock = S.movimientos_stock.filter(m => (m.campo_id && cIds.has(m.campo_id)) || (m.orden_id && oKeep.has(m.orden_id))); const mIds = new Set(S.movimientos_stock.map(m => m.id));
+    S.matches = S.matches.filter(x => mIds.has(x.salida_mov_id)); 
+    S.costos_varios = S.costos_varios.filter(c => (c.lote_id ? lIds.has(c.lote_id) : c.campo_id ? cIds.has(c.campo_id) : true));
+    S.produccion = S.produccion.filter(x => lIds.has(x.lote_id)); S.cosechas = S.cosechas.filter(x => lIds.has(x.lote_id));
+    S.restringido = perm;
   },
   // helpers de búsqueda
   campo: id => S.campos.find(c => c.id === id),
@@ -415,35 +452,110 @@ const App = {
     await UI.run(async () => {
       await Store.loadGlobal();
       if (DB.mode === 'local' && !S.campanias.length) await Demo.seed();
-      const saved = localStorage.getItem('agri_campania');
-      const c = S.campanias.find(x => x.id === saved) || S.campanias[S.campanias.length - 1];
+      const vis = Store.sociedadesVisibles(); const savedS = localStorage.getItem('agri_sociedad');
+      Store.setSociedad((vis.find(x => x.id === savedS) || vis[0] || {}).id);
+      const saved = localStorage.getItem('agri_campania'); const cs = Store.campaniasDeSociedad();
+      const c = cs.find(x => x.id === saved) || cs[cs.length - 1];
       await Store.loadCampania(c ? c.id : null);
-      this.renderCampanias(); this.renderTabs();
+      this.renderSociedades(); this.renderCampanias(); this.renderTabs();
       this.go(localStorage.getItem('agri_tab') || 'dashboard');
     });
   },
-  renderCampanias() { document.getElementById('sel-campania').innerHTML = opts(S.campanias, S.campania && S.campania.id, c => 'Campaña ' + c.nombre, c => c.id); },
+  renderCampanias() { document.getElementById('sel-campania').innerHTML = opts(Store.campaniasDeSociedad(), S.campania && S.campania.id, c => 'Campaña ' + c.nombre, c => c.id); },
+  renderSociedades() { const vis = Store.sociedadesVisibles(); const sel = document.getElementById('sel-sociedad'); sel.innerHTML = opts(vis, S.sociedad && S.sociedad.id, x => x.nombre, x => x.id); sel.classList.toggle('hidden', vis.length < 2); document.getElementById('btn-sociedades').classList.toggle('hidden', !Store.esAdmin()); document.getElementById('btn-usuarios').classList.toggle('hidden', !Store.esAdmin()); },
+  async setSociedad(id) { await UI.run(async () => { Store.setSociedad(id); const cs = Store.campaniasDeSociedad(); const c = cs[cs.length - 1]; localStorage.setItem('agri_campania', c ? c.id : ''); await Store.loadCampania(c ? c.id : null); this.renderSociedades(); this.renderCampanias(); this.render(); }); },
   async setCampania(id) { localStorage.setItem('agri_campania', id); await UI.run(async () => { await Store.loadCampania(id); this.renderCampanias(); this.render(); }); },
   renderTabs() { document.getElementById('tabs').innerHTML = TABS.map(([k, l, n]) => `<button class="${k === this.tab ? 'active' : ''}" onclick="App.go('${k}')"><span class="n">${n}</span>${l}</button>`).join(''); },
   go(k) { this.tab = k; localStorage.setItem('agri_tab', k); this.renderTabs(); this.render(); window.scrollTo(0, 0); },
   render() {
     const m = document.getElementById('main');
-    if (!S.campania) { m.innerHTML = '<div class="card"><h2>Sin campaña</h2><p>Creá la primera campaña con el botón <b>+ Campaña</b> de arriba.</p></div>'; return; }
-    const mod = Tabs[this.tab]; m.innerHTML = ''; mod.render(m);
+    if (!S.sociedad && S.sociedades.length && !Store.esAdmin()) { m.innerHTML = `<div class="card"><h2>Sin acceso</h2><p>Tu usuario (<b>${esc(Store.email())}</b>) todavía no tiene asignada ninguna sociedad. Pedile al administrador que te habilite desde el botón <b>Usuarios</b>.</p></div>`; return; }
+    if (!S.campania) { m.innerHTML = `<div class="card"><h2>Sin campaña</h2><p>${S.sociedad ? `La sociedad <b>${esc(S.sociedad.nombre)}</b> todavía no tiene campañas. ` : ''}Creá la primera campaña con el botón <b>+ Campaña</b> de arriba.</p></div>`; return; }
+    const mod = Tabs[this.tab]; m.innerHTML = S.restringido ? `<div class="note" style="margin-bottom:10px">Estás viendo sólo: <b>${S.restringido.map(esc).join(', ')}</b>.</div>` : ''; const box = document.createElement('div'); m.appendChild(box); mod.render(box);
   },
   refresh() { this.render(); },
   async refrescar() {
     const b = document.getElementById('btn-refresh'); if (b) { b.disabled = true; b.textContent = '↻ Actualizando…'; }
-    await UI.run(async () => { await Store.loadGlobal(); await Store.loadCampania(S.campania ? S.campania.id : null); this.renderCampanias(); this.render(); }, 'Datos actualizados desde la base');
+    await UI.run(async () => { await Store.loadGlobal(); Store.setSociedad(S.sociedad ? S.sociedad.id : (Store.sociedadesVisibles()[0] || {}).id); await Store.loadCampania(S.campania ? S.campania.id : null); this.renderSociedades(); this.renderCampanias(); this.render(); }, 'Datos actualizados desde la base');
     if (b) { b.disabled = false; b.textContent = '↻ Refrescar'; }
   },
 };
 const Tabs = {};
 
+/* ---------------- Sociedades (negocios) ---------------- */
+const Sociedades = {
+  editar(id) {
+    const soc = id ? S.sociedades.find(x => x.id === id) : null; const x = soc || { nombre: '', corto: '', aportantes: [{ id: 'PEGSA', nombre: 'Pecuaria El Garabí' }], usuarios: [], participacion_pactada: {} };
+    UI.modal(`<h3>Sociedades / negocios</h3>
+      <div class="tablewrap"><table class="t compact"><thead><tr><th>Sociedad</th><th>Aportantes</th><th>Usuarios con acceso</th><th>Campañas</th><th></th></tr></thead><tbody>
+      ${S.sociedades.map(sc => `<tr><td><b>${esc(sc.nombre)}</b><div class="muted small">${esc(sc.corto || '')}</div></td><td class="small">${(sc.aportantes || []).map(a => tagAp(a.id)).join(' ')}</td><td class="small">${S.permisos.filter(p => p.sociedad_id === sc.id).map(p => esc(p.email) + (p.campos && p.campos.length ? ' <span class="muted">(' + p.campos.map(esc).join(', ') + ')</span>' : '')).join('<br>') || '<span class="muted">sólo administradores</span>'}</td><td class="num">${S.campanias.filter(c => c.sociedad_id === sc.id).length}</td><td class="actions"><button class="btn xs" onclick="Sociedades.editar('${sc.id}')">Editar</button></td></tr>`).join('')}
+      </tbody></table></div>
+      <h4 style="margin-top:12px">${soc ? 'Editar: ' + esc(soc.nombre) : 'Nueva sociedad'}</h4>
+      <div class="row"><div class="w2"><label class="f">Nombre</label><input id="sc-nombre" value="${esc(x.nombre)}" placeholder="PEGSA & El Yulto"></div><div><label class="f">Nombre corto (cabecera)</label><input id="sc-corto" value="${esc(x.corto || '')}" placeholder="PEGSA · El Yulto"></div></div>
+      <div class="row" style="margin-top:8px"><div><label class="f">Aportantes (uno por línea: CODIGO = Nombre)</label><textarea id="sc-ap" rows="4" style="width:100%">${esc((x.aportantes || []).map(a => a.id + ' = ' + (a.nombre || '')).join('\n'))}</textarea><div class="muted small">El código es corto y en mayúsculas (PEGSA, GYV, YULTO). No cambiar los códigos de una sociedad con datos cargados.</div></div>
+      <div><label class="f">Quién la ve</label><div class="note">Se define por usuario en el botón <b>Usuarios</b> (sociedades y campos que ve cada mail). Los administradores (${ADMINS.join(', ')}) ven todo.</div></div></div>
+      <div class="foot">${soc && S.campanias.filter(c => c.sociedad_id === soc.id).length === 0 ? `<button class="btn danger" onclick="Sociedades.borrar('${soc.id}')">Eliminar</button><span style="flex:1"></span>` : ''}<button class="btn" onclick="UI.closeModal()">Cancelar</button><button class="btn primary" onclick="Sociedades.guardar(${soc ? `'${soc.id}'` : 'null'})">Guardar</button></div>`);
+    document.getElementById('modal').style.maxWidth = '960px';
+  },
+  async guardar(id) {
+    const nombre = UI.val('sc-nombre').trim(); if (!nombre) return UI.toast('Falta el nombre', true);
+    const aportantes = UI.val('sc-ap').split('\n').map(l => l.trim()).filter(Boolean).map(l => { const [a, ...b] = l.split('='); return { id: a.trim().toUpperCase().replace(/[^A-Z0-9_]/g, ''), nombre: b.join('=').trim() || a.trim() }; }).filter(a => a.id);
+    if (!aportantes.length) return UI.toast('Cargá al menos un aportante', true);
+    const row = { nombre, corto: UI.val('sc-corto').trim() || nombre, aportantes, activa: true };
+    await UI.run(async () => { if (id) await DB.update('sociedades', id, row); else await DB.insert('sociedades', { ...row, participacion_pactada: {}, created_at: new Date().toISOString() }); await Store.loadGlobal(); Store.setSociedad(S.sociedad ? S.sociedad.id : (Store.sociedadesVisibles()[0] || {}).id); UI.closeModal(); App.renderSociedades(); App.renderCampanias(); App.render(); }, 'Sociedad guardada');
+  },
+  async borrar(id) { if (!confirm('¿Eliminar esta sociedad? (sólo se puede si no tiene campañas)')) return; await UI.run(async () => { await DB.remove('sociedades', id); await Store.loadGlobal(); if (S.sociedad && S.sociedad.id === id) { Store.setSociedad((Store.sociedadesVisibles()[0] || {}).id); const cs = Store.campaniasDeSociedad(); await Store.loadCampania(cs.length ? cs[cs.length - 1].id : null); } UI.closeModal(); App.renderSociedades(); App.renderCampanias(); App.render(); }, 'Sociedad eliminada'); },
+};
+
+/* ---------------- Usuarios: qué sociedades y campos ve cada mail ---------------- */
+const Usuarios = {
+  _campos: null,
+  async camposPorSociedad() {
+    if (this._campos) return this._campos;
+    const todos = await DB.select('campos'); const r = {};
+    S.sociedades.forEach(sc => { const cIds = S.campanias.filter(c => c.sociedad_id === sc.id).map(c => c.id); r[sc.id] = [...new Set(todos.filter(c => cIds.includes(c.campania_id)).map(c => String(c.nombre).toUpperCase().trim()))].sort(); });
+    this._campos = r; return r;
+  },
+  async editar(email) {
+    const CP = await this.camposPorSociedad();
+    const mails = [...new Set(S.permisos.map(p => String(p.email).toLowerCase().trim()))].sort(); const sel = (email || this.sel || mails[0] || '').toLowerCase();
+    const perms = sel ? S.permisos.filter(p => String(p.email).toLowerCase().trim() === sel) : [];
+    UI.modal(`<h3>Usuarios y permisos</h3>
+      <div class="note info">Cada usuario entra con su mail (creado en Supabase → Authentication). Acá marcás qué sociedades ve y, dentro de cada una, si ve todos los campos o sólo algunos. Un mail sin ninguna sociedad marcada no ve nada. Los administradores (${ADMINS.map(esc).join(', ')}) ven todo siempre.</div>
+      <div class="grid2" style="margin-top:10px"><div class="card" style="padding:10px"><h4>Usuarios</h4>
+        ${mails.map(m => `<div style="display:flex;justify-content:space-between;align-items:center;padding:4px 6px;border-radius:6px;${m === sel ? 'background:var(--green-2)' : ''}"><a href="#" onclick="Usuarios.sel='${m}';Usuarios.editar('${m}');return false">${esc(m)}</a><button class="btn xs danger" title="Quitar todos los permisos" onclick="Usuarios.borrar('${m}')">✕</button></div>`).join('') || '<div class="muted small">Todavía no hay usuarios con permisos.</div>'}
+        <div class="row" style="margin-top:8px"><div class="w2"><label class="f">Agregar mail</label><input type="email" id="us-new" placeholder="usuario@mail.com"></div><div class="auto"><label class="f">&nbsp;</label><button class="btn sm" onclick="Usuarios.agregar()">Agregar</button></div></div></div>
+      <div class="card" style="padding:10px"><h4>${sel ? 'Permisos de ' + esc(sel) : 'Elegí o agregá un usuario'}</h4>
+        ${sel ? S.sociedades.map(sc => { const p = perms.find(x => x.sociedad_id === sc.id); const campos = CP[sc.id] || []; const restr = p && p.campos && p.campos.length; return `<div style="border:1px solid var(--line);border-radius:8px;padding:8px;margin-bottom:8px">
+          <label style="display:flex;gap:8px;align-items:center;font-weight:600"><input type="checkbox" class="us-soc" data-soc="${sc.id}" ${p ? 'checked' : ''} onchange="Usuarios.toggleSoc(this)"> ${esc(sc.nombre)}</label>
+          <div class="us-det" data-soc="${sc.id}" style="margin:6px 0 0 24px;${p ? '' : 'display:none'}">
+            <label style="display:flex;gap:6px;align-items:center"><input type="radio" name="us-modo-${sc.id}" value="todos" ${restr ? '' : 'checked'} onchange="Usuarios.modo(this)"> Toda la sociedad (todos los campos)</label>
+            <label style="display:flex;gap:6px;align-items:center"><input type="radio" name="us-modo-${sc.id}" value="algunos" ${restr ? 'checked' : ''} onchange="Usuarios.modo(this)"> Sólo estos campos:</label>
+            <div class="us-campos" data-soc="${sc.id}" style="margin:4px 0 0 22px;display:${restr ? 'flex' : 'none'};flex-wrap:wrap;gap:6px 14px">${campos.map(c => `<label style="display:flex;gap:4px;align-items:center"><input type="checkbox" class="us-campo" value="${esc(c)}" ${restr && p.campos.map(x => String(x).toUpperCase()).includes(c) ? 'checked' : ''}> ${esc(c)}</label>`).join('') || '<span class="muted small">Esta sociedad todavía no tiene campos cargados.</span>'}</div>
+          </div></div>`; }).join('') : ''}
+      </div></div>
+      <div class="foot"><button class="btn" onclick="UI.closeModal()">Cerrar</button>${sel ? `<button class="btn primary" onclick="Usuarios.guardar('${sel}')">Guardar permisos de ${esc(sel)}</button>` : ''}</div>`);
+    document.getElementById('modal').style.maxWidth = '1000px';
+  },
+  toggleSoc(cb) { const d = document.querySelector(`.us-det[data-soc="${cb.dataset.soc}"]`); if (d) d.style.display = cb.checked ? '' : 'none'; },
+  modo(r) { const soc = r.name.replace('us-modo-', ''); const d = document.querySelector(`.us-campos[data-soc="${soc}"]`); if (d) d.style.display = r.value === 'algunos' ? 'flex' : 'none'; },
+  agregar() { const m = (UI.val('us-new') || '').trim().toLowerCase(); if (!m || !m.includes('@')) return UI.toast('Poné un mail válido', true); this.sel = m; if (!S.permisos.some(p => String(p.email).toLowerCase() === m)) S.permisos.push({ id: null, email: m, sociedad_id: null, campos: null, _tmp: true }); this.editar(m); },
+  async guardar(email) {
+    const rows = [];
+    document.querySelectorAll('.us-soc').forEach(cb => { if (!cb.checked) return; const soc = cb.dataset.soc; const modo = (document.querySelector(`input[name="us-modo-${soc}"]:checked`) || {}).value; const campos = modo === 'algunos' ? [...document.querySelectorAll(`.us-campos[data-soc="${soc}"] .us-campo:checked`)].map(x => x.value) : null; if (modo === 'algunos' && !campos.length) return; rows.push({ email, sociedad_id: soc, campos }); });
+    await UI.run(async () => {
+      await DB.removeWhere('permisos', { email });
+      for (const r of rows) await DB.insert('permisos', { ...r, created_at: new Date().toISOString() });
+      S.permisos = await DB.select('permisos'); this._campos = null; this.editar(email);
+    }, rows.length ? `Permisos guardados para ${email}` : `${email} quedó sin acceso a ninguna sociedad`);
+  },
+  async borrar(email) { if (!confirm(`¿Quitar todos los permisos de ${email}?`)) return; await UI.run(async () => { await DB.removeWhere('permisos', { email }); S.permisos = (await DB.select('permisos')); this.sel = null; this.editar(); }, 'Permisos quitados'); },
+};
+
 /* ---------------- Campañas ---------------- */
 const Campanias = {
   form(c = {}) {
-    const pp = c.participacion_pactada || { PEGSA: 60, GYV: 20, MERZ: 20 };
+    const pp = c.participacion_pactada || (S.sociedad && S.sociedad.participacion_pactada) || { PEGSA: 60, GYV: 20, MERZ: 20 };
     return `<h3>${c.id ? 'Configurar campaña' : 'Nueva campaña'}</h3>
       <div class="row"><div><label class="f">Nombre</label><input id="c-nombre" value="${esc(c.nombre || '')}" placeholder="2026/27"></div>
       <div><label class="f">Primer mes de alquiler</label><input type="month" id="c-mes" value="${esc(c.mes_inicio || (new Date().getFullYear() + '-05'))}"></div></div>
@@ -461,8 +573,8 @@ const Campanias = {
     await UI.run(async () => {
       if (edit) { await Store.saveCampania(patch); }
       else {
-        const c = await DB.insert('campanias', { ...patch, activa: true, precios: {}, proyeccion: {}, created_at: new Date().toISOString() });
-        if (UI.val('c-copiar') && S.campania) {
+        const c = await DB.insert('campanias', { ...patch, sociedad_id: S.sociedad ? S.sociedad.id : null, activa: true, precios: {}, proyeccion: {}, created_at: new Date().toISOString() });
+        if (UI.val('c-copiar') && S.campania && Store.campaniasDeSociedad().length) {
           for (const campo of S.campos) {
             const nc = await DB.insert('campos', { campania_id: c.id, nombre: campo.nombre, participa: campo.participa, aportante_alquiler: campo.aportante_alquiler, dueno: campo.dueno, qq_ha: campo.qq_ha, obs: campo.obs || '', plano: campo.plano || null });
             await DB.insertMany('lotes', Store.lotesDe(campo.id).map(l => ({ campania_id: c.id, campo_id: nc.id, nombre: l.nombre, has: l.has, cultivo: l.cultivo, ciclo: l.ciclo, participa: l.participa, obs: '' })));
@@ -475,7 +587,7 @@ const Campanias = {
   },
   async borrar() {
     if (!confirm(`¿Eliminar la campaña ${S.campania.nombre} con TODOS sus datos? Esta acción no se puede deshacer.`)) return;
-    await UI.run(async () => { await DB.remove('campanias', S.campania.id); localStorage.removeItem('agri_campania'); await Store.loadGlobal(); const c = S.campanias[S.campanias.length - 1]; await Store.loadCampania(c ? c.id : null); UI.closeModal(); App.renderCampanias(); App.render(); }, 'Campaña eliminada');
+    await UI.run(async () => { await DB.remove('campanias', S.campania.id); localStorage.removeItem('agri_campania'); await Store.loadGlobal(); const cs = Store.campaniasDeSociedad(); const c = cs[cs.length - 1]; await Store.loadCampania(c ? c.id : null); UI.closeModal(); App.renderCampanias(); App.render(); }, 'Campaña eliminada');
   },
 };
 </script>
@@ -1610,7 +1722,7 @@ Tabs.dashboard = {
     const pendStock = Tabs.stock.salidasPendientes().length, pendPrecio = Tabs.stock.remitosSinPrecio().length, pendLab = S.labores.filter(l => !l.factura).length;
     const rubros = ['alquiler', 'insumos', 'labores', 'varios', 'cosecha'];
     // proyección por cultivo
-    const cult = CULTIVOS.map(c => { const arr = part.filter(r => r.cultivo === c); const has = sum(arr, r => r.has); const p = proy[c] || {}; const real = {}; rubros.forEach(k => real[k] = has ? sum(arr, r => r[k]) / has : 0); const pr = {}; rubros.forEach(k => pr[k] = num(p[k])); const proyTot = rubros.reduce((s, k) => s + pr[k], 0), realTot = rubros.reduce((s, k) => s + real[k], 0);
+    const cult = CULTIVOS.filter(c => part.some(r => r.cultivo === c) || Object.keys(proy[c] || {}).length).map(c => { const arr = part.filter(r => r.cultivo === c); const has = sum(arr, r => r.has); const p = proy[c] || {}; const real = {}; rubros.forEach(k => real[k] = has ? sum(arr, r => r[k]) / has : 0); const pr = {}; rubros.forEach(k => pr[k] = num(p[k])); const proyTot = rubros.reduce((s, k) => s + pr[k], 0), realTot = rubros.reduce((s, k) => s + real[k], 0);
       const precio = num(p.precio_usd_tn), rinde = num(p.rinde_qq); const ventaP = rinde / 10 * precio; return { c, has, real, pr, proyTot, realTot, precio, rinde, ventaP, resP: ventaP - proyTot, realRinde: sum(arr, r => r.has_prod) ? sum(arr, r => r.kg) / sum(arr, r => r.has_prod) / 100 : 0 }; });
     m.innerHTML = `<div class="kpis">
       <div class="kpi"><div class="l">Hectáreas en sociedad</div><div class="v">${fmt(tot.has, 1)}</div><div class="s">${CULTIVOS.map(c => c + ' ' + fmt(sum(part.filter(r => r.cultivo === c), r => r.has), 0)).join(' · ')}</div></div>
@@ -1660,10 +1772,26 @@ Tabs.dashboard = {
       if (num(lb.monto_usd)) add(mes, grupoDe(l), 'Labores', num(lb.monto_usd)); else { acc.labSinFactura++; acc.labSinFacturaHas += num(lb.has_reales ?? ol.has); } });
     return acc;
   },
+  /* pedido de insumos mensualizado (cantidades, sin precio) vs. usado en OT y remitido al depósito */
+  renderPedido(cid, B) {
+    const campo = Store.campo(cid) || { nombre: '?' }; const lotes = Store.lotesDe(cid); const meses = [...new Set(B.items.map(i => i.mes))].sort();
+    const match = (nombre, keys) => { const n = (nombre || '').toUpperCase(); return (keys || []).some(k => new RegExp(k, 'i').test(n)); };
+    const usado = keys => { let t = 0; S.ordenes.forEach(o => { const ols = S.orden_lotes.filter(x => x.orden_id === o.id); const hasO = sum(ols, x => x.has); if (!hasO) return; const f = sum(ols.filter(ol => lotes.some(l => l.id === ol.lote_id)), x => x.has) / hasO; if (!f) return; S.orden_insumos.filter(x => x.orden_id === o.id && match((Store.insumo(x.insumo_id) || {}).nombre, keys)).forEach(x => t += num(x.cantidad) * f); }); return t; };
+    const remitido = keys => sum(S.movimientos_stock.filter(m => m.campo_id === cid && m.cantidad > 0 && match((Store.insumo(m.insumo_id) || {}).nombre, keys)), m => m.cantidad);
+    const prods = {}; B.items.forEach(i => { const k = i.producto; prods[k] = prods[k] || { producto: k, categoria: i.categoria, unidad: i.unidad, keys: i.keys, meses: {}, total: 0 }; prods[k].meses[i.mes] = (prods[k].meses[i.mes] || 0) + num(i.cantidad); prods[k].total += num(i.cantidad); });
+    const rows = Object.values(prods).map(pr => ({ ...pr, usado: usado(pr.keys), remitido: remitido(pr.keys) }));
+    const open = this.presuOpen === cid;
+    return `<div class="card"><h2>Pedido de insumos ${esc(campo.nombre)} <span class="muted small">${esc(B.fuente || '')} · ${fdate(B.fecha)} · cantidades estimadas, sin precio</span><span class="spacer"></span><button class="btn sm" onclick="Tabs.dashboard.presuOpen=${open ? 'null' : `'${cid}'`};App.render()">${open ? 'Ocultar labores previstas' : 'Ver labores previstas'}</button> <button class="btn sm danger" onclick="Tabs.dashboard.presuQuitar('${cid}')">Quitar</button></h2>
+      ${open && B.labores ? `<div class="note" style="margin-bottom:8px">${B.labores.map(l => `<div><b>${mesLabel(l.mes)}:</b> ${esc(l.detalle)}</div>`).join('')}</div>` : ''}
+      <div class="tablewrap"><table class="t compact"><thead><tr><th>Categoría</th><th>Producto (según pedido)</th><th>Un.</th>${meses.map(m => `<th class="num">${mesLabel(m)}</th>`).join('')}<th class="num">Pedido total</th><th class="num">Remitido al depósito</th><th class="num">Usado en OT</th><th class="num">% usado</th></tr></thead><tbody>
+      ${rows.map(r => { const p = r.usado / (r.total || 1); return `<tr><td class="small">${esc(r.categoria)}</td><td><b>${esc(r.producto)}</b></td><td>${esc(r.unidad)}</td>${meses.map(m => `<td class="num">${r.meses[m] ? fmt(r.meses[m], 1) : ''}</td>`).join('')}<td class="num"><b>${fmt(r.total, 1)}</b></td><td class="num">${r.remitido ? fmt(r.remitido, 1) : '—'}</td><td class="num">${r.usado ? fmt(r.usado, 1) : '—'}</td><td class="num ${r.usado > r.total * 1.05 ? 'neg' : ''}">${r.usado ? pct(p, 0) : ''}</td></tr>`; }).join('')}
+      </tbody></table></div>
+      <p class="muted small" style="margin-top:8px">Usado en OT = cantidades cargadas en las órdenes de trabajo de los lotes de ${esc(campo.nombre)} (prorrateadas si la OT abarca varios campos). Remitido = compras y stock inicial cargados con este depósito. El pedido del asesor es estimado y se ajusta con los monitoreos.</p></div>`;
+  },
   renderPresupuestos() {
     const PR = (S.campania.proyeccion || {}).presupuestos || {}; const ids = Object.keys(PR); if (!ids.length) return '';
     const mesHoy = hoy().slice(0, 7);
-    return ids.map(cid => { const B = PR[cid], campo = Store.campo(cid) || { nombre: '?' }; const R = this.presuReal(cid, B);
+    return ids.map(cid => { const B = PR[cid], campo = Store.campo(cid) || { nombre: '?' }; if (B.tipo === 'pedido') return this.renderPedido(cid, B); const R = this.presuReal(cid, B);
       const meses = B.meses.slice().sort((a, b) => a.mes.localeCompare(b.mes)); const mesesReal = Object.keys(R.mes).filter(m => !meses.some(x => x.mes === m)).sort(); const todos = [...meses.map(x => x.mes), ...mesesReal].sort();
       const presHasta = sum(meses.filter(x => x.mes <= mesHoy), x => x.total); let accP = 0, accR = 0;
       const open = this.presuOpen === cid;
@@ -1705,7 +1833,8 @@ const Demo = {
     for (const c of contr) await DB.insert('contratistas', { nombre: c, activo: true });
     const ins = [['2,4D ETIL HEXIL', 'lt'], ['2,4D ENLIST', 'lt'], ['2,4D AMINA', 'lt'], ['2,4D EMPIRIC CORTEVA', 'lt'], ['ABAMECTINA 3,6%', 'lt'], ['ABAMECTINA 8,4%', 'lt'], ['ACEITE METILADO SIL. V6', 'lt'], ['ADENGO BAYER', 'lt'], ['ATRAZINA 90%', 'kg'], ['ATRAZINA GESAPRIM', 'kg'], ['ATRAZINA TRAC 90', 'kg'], ['BELT 48 BAYER', 'lt'], ['BIFENTRIN 10%', 'lt'], ['CLETODIM 24%', 'lt'], ['CLETODIM SELECT', 'lt'], ['CLORANTRANILIPROLE 20% (CORAGEN)', 'lt'], ['CONVEY BASF', 'lt'], ['CORRECTOR PH WATERSHOCK', 'lt'], ['CREAVIS DUO FUNGI', 'lt'], ['DICAMBA BANVEL', 'lt'], ['DICAMBA ATECTRA BASF', 'lt'], ['DICLOSULAM PAXEO', 'kg'], ['SPIDER DICLOSULAM', 'kg'], ['DUAL GOLD S METOLACLORO', 'lt'], ['S METOLACLORO', 'lt'], ['FERTILIZANTE MICROGRANULADO', 'kg'], ['MICROGRANULADO BOOST', 'kg'], ['MICROGRANULADO AMAUTA', 'kg'], ['FERTILIZANTE NUTRIEVOLUTION', 'kg'], ['UREA PROTEGIDA', 'kg'], ['FIPRONIL', 'lt'], ['FIXER BIOFILM (COMPATIBILIZADOR)', 'lt'], ['FLUMIOXAZIN', 'lt'], ['FREEDOM FUNGICIDA', 'lt'], ['GALANT MAX HALOXYFOP', 'lt'], ['HALOXYFOP 54%', 'lt'], ['GIBERELAC 10%', 'lt'], ['GLIFOSATO CONTROL MAX', 'kg'], ['GLIFOSATO NUVOLX', 'lt'], ['GLIFOSATO SIGMA', 'lt'], ['GLIFOSATO SULFOSATO', 'lt'], ['GLUFOSINATO DE AMONIO', 'lt'], ['HEAT SAFLUFENACIL', 'kg'], ['LAMBDACIALOTRINA 25%', 'lt'], ['METSULFURON', 'kg'], ['MUSTANG (ZETAMETRINA)', 'lt'], ['NICOSULFURON SUMMIT AGRO', 'lt'], ['NOMOLT BASF', 'lt'], ['PARAQUAT', 'lt'], ['PICLORAM (TORDON)', 'lt'], ['SPEED ACTIVE GEL', 'lt'], ['SULFATO DE AMONIO', 'kg'], ['SULFOCIT BIOFILM', 'kg'], ['SULFENTRAZONE 50% CAPAZ FMC', 'lt'], ['TERBUTILAZINA 50%', 'lt'], ['SEMILLA DE CENTENO', 'kg'], ['SEM SOJA DM 46 E 25', 'big bag'], ['SEM SOJA DM 50 E 22', 'big bag'], ['SEM SOJA DM 50 E 25', 'big bag'], ['SEMILLA DE MAIZ 8380 BRV', 'bolsa'], ['SEMILLA DE MAIZ LT 723 B3', 'bolsa'], ['SEMILLA DE MAIZ KWS 3916 VIP', 'bolsa'], ['SEMILLA DE MAIZ REFUGIO RFG22', 'bolsa']];
     const I = {}; for (const [n, u] of ins) I[n] = await DB.insert('insumos', { nombre: n, unidad: u, activo: true });
-    const camp = await DB.insert('campanias', { nombre: '2025/26 (demo)', mes_inicio: '2025-05', activa: true, participacion_pactada: { PEGSA: 60, GYV: 20, MERZ: 20 }, precios: { SOJA: { precio_usd_tn: 280, gastos_pct: 4, gastos_usd_tn: 0 }, MAIZ: { precio_usd_tn: 150, gastos_pct: 6, gastos_usd_tn: 0 } }, proyeccion: { SOJA: { alquiler: 400, insumos: 250, labores: 110, varios: 20, cosecha: 85, rinde_qq: 35, precio_usd_tn: 280 }, MAIZ: { alquiler: 400, insumos: 520, labores: 130, varios: 20, cosecha: 105, rinde_qq: 85, precio_usd_tn: 150 } }, created_at: new Date().toISOString() });
+    const soc = await DB.insert('sociedades', { nombre: 'PEGSA & Agronomía G&V (demo)', corto: 'PEGSA · G&V · Merz', aportantes: APORTANTES_DEFAULT, usuarios: [], participacion_pactada: {}, activa: true, created_at: new Date().toISOString() });
+    const camp = await DB.insert('campanias', { sociedad_id: soc.id, nombre: '2025/26 (demo)', mes_inicio: '2025-05', activa: true, participacion_pactada: { PEGSA: 60, GYV: 20, MERZ: 20 }, precios: { SOJA: { precio_usd_tn: 280, gastos_pct: 4, gastos_usd_tn: 0 }, MAIZ: { precio_usd_tn: 150, gastos_pct: 6, gastos_usd_tn: 0 } }, proyeccion: { SOJA: { alquiler: 400, insumos: 250, labores: 110, varios: 20, cosecha: 85, rinde_qq: 35, precio_usd_tn: 280 }, MAIZ: { alquiler: 400, insumos: 520, labores: 130, varios: 20, cosecha: 105, rinde_qq: 85, precio_usd_tn: 150 } }, created_at: new Date().toISOString() });
     const campos = [['EL COLORADITO', true, 12, [['1-3', 306, 'MAIZ'], ['2', 241, 'SOJA']]], ['EL DESCANSO', true, 12, [['1-2-3', 129, 'SOJA'], ['4', 52, 'MAIZ'], ['5', 56, 'MAIZ']]], ['EL TACURU', true, 13, [['17-18-22-23', 262.6, 'MAIZ'], ['19-20', 284.6, 'SOJA']]], ['EL MARTILLO', true, 13, [['1-5-9-10-14-17-18', 306, 'MAIZ'], ['3', 46, 'MAIZ'], ['4', 25, 'MAIZ'], ['6-7-8-11-12-13-15', 374, 'SOJA']]], ['EL HARAS', false, 0, [['UNICO', 74, 'MAIZ']]]];
     const C = {}, Lt = {};
     for (const [n, p, qq, lotes] of campos) { const c = await DB.insert('campos', { campania_id: camp.id, nombre: n, participa: p, qq_ha: qq, aportante_alquiler: 'PEGSA', dueno: 'PEGSA', obs: '' }); C[n] = c; for (const [ln, has, cu] of lotes) Lt[n + '/' + ln] = await DB.insert('lotes', { campania_id: camp.id, campo_id: c.id, nombre: ln, has, cultivo: cu, ciclo: 'PRIMERA', participa: true, obs: '' }); }
