@@ -104,6 +104,8 @@ table.t.compact td,table.t.compact th{padding:4px 6px}
 .tag.gray{background:#eceee9;color:var(--muted)}
 .tag.PEGSA{background:var(--green-2);color:var(--pegsa)}
 .tag.GYV{background:var(--blue-2);color:var(--gyv)}
+tr.lb-lock input,tr.lb-lock select{pointer-events:none;background:#eef2ee;color:#555}
+tr.lb-lock{cursor:pointer}
 .tag.YULTO{background:#fde8d7;color:#8a4b2c}
 .tag.MERZ{background:var(--amber-2);color:var(--merz)}
 
@@ -1123,13 +1125,14 @@ Tabs.ordenes = {
       <div class="tablewrap"><table class="t"><thead><tr><th>N°</th><th>Fecha</th><th>Tipo</th><th>Campos · lotes</th><th class="num">Has</th><th>Aplicador</th><th>Insumos</th><th class="num">Costo USD</th><th>Estado</th><th></th></tr></thead><tbody>
       ${list.map(o => { const ols = S.orden_lotes.filter(x => x.orden_id === o.id), ois = S.orden_insumos.filter(x => x.orden_id === o.id); const labs = S.labores.filter(l => l.orden_id === o.id); const fact = labs.length && labs.every(l => l.factura); const pend = S.movimientos_stock.filter(m => m.orden_id === o.id && !m.facturado).length;
         const campos = [...new Set(ols.map(ol => (Store.campo((Store.lote(ol.lote_id) || {}).campo_id) || {}).nombre))].join(', ');
-        return `<tr style="${o.alterna ? 'background:#fbfaf4' : ''}"><td><b>${otLabel(o)}</b>${o.alterna ? `<div class="muted small">bis de la OT ${o.ot_ref}</div>` : ''}</td><td class="nowrap">${fdate(o.fecha)}</td><td>${esc(o.tipo_labor)}</td><td><b>${esc(campos)}</b><div class="muted small">${ols.map(ol => 'L ' + esc((Store.lote(ol.lote_id) || {}).nombre) + ' (' + fmt(ol.has, 1) + ')').join(' · ')}</div></td><td class="num">${fmt(sum(ols, x => x.has), 1)}</td><td>${esc((Store.contratista(o.contratista_id) || {}).nombre || '—')}</td>
+        return `<tr style="${o.alterna ? 'background:#fbfaf4' : ''}"><td><b>${otLabel(o)}</b>${Tabs.labores.ordenFijada(o.id).length ? ' <span title="Factura de labor fijada">🔒</span>' : ''}${o.alterna ? `<div class="muted small">bis de la OT ${o.ot_ref}</div>` : ''}</td><td class="nowrap">${fdate(o.fecha)}</td><td>${esc(o.tipo_labor)}</td><td><b>${esc(campos)}</b><div class="muted small">${ols.map(ol => 'L ' + esc((Store.lote(ol.lote_id) || {}).nombre) + ' (' + fmt(ol.has, 1) + ')').join(' · ')}</div></td><td class="num">${fmt(sum(ols, x => x.has), 1)}</td><td>${esc((Store.contratista(o.contratista_id) || {}).nombre || '—')}</td>
         <td class="small">${ois.map(oi => esc((Store.insumo(oi.insumo_id) || {}).nombre) + ' ' + fmt(oi.cantidad, 1) + ' ' + esc(oi.unidad || '')).join('<br>')}</td>
         <td class="num">${(() => { const cs = Calc.costoInsumosOrden(o.id); const t = sum(cs, c => c.usd), lab = sum(labs, l => l.monto_usd); return t || lab ? `<b>${fmt(t + lab)}</b><div class="muted small">ins. ${fmt(t)}${cs.some(c => c.estimado) ? '*' : ''} · lab. ${fmt(lab)}</div>` : ''; })()}</td>
         <td>${fact ? '<span class="tag ok">facturada</span>' : '<span class="tag warn">labor s/facturar</span>'} ${pend ? `<span class="tag warn">${pend} insumo(s) s/precio</span>` : ''}</td>
         <td class="actions"><button class="btn xs" onclick="PDF.orden('${o.id}')">PDF</button> <button class="btn xs" onclick="Tabs.ordenes.editar('${o.id}')">Editar</button> <button class="btn xs danger" onclick="Tabs.ordenes.eliminar('${o.id}')">✕</button></td></tr>`; }).join('') || '<tr><td colspan="10" class="muted">No hay órdenes.</td></tr>'}</tbody></table></div><p class="muted small">* insumos valuados a precio sugerido (falta precio en Stock).</p>`;
   },
-  editar(id) {
+  async editar(id) {
+    if (!(await Tabs.labores.liberarOrden(id))) return;
     const o = Store.orden(id); const ols = S.orden_lotes.filter(x => x.orden_id === id), ois = S.orden_insumos.filter(x => x.orden_id === id); const hasTot = sum(ols, x => x.has);
     this.editId = id;
     this.draft = { numero: o.numero, alterna: !!o.alterna, ot_ref: o.ot_ref || '', sufijo: o.sufijo || '', fecha: o.fecha, tipo_labor: o.tipo_labor, contratista_id: o.contratista_id, contratista_nombre: (Store.contratista(o.contratista_id) || {}).nombre || '', obs: o.obs || '',
@@ -1138,6 +1141,7 @@ Tabs.ordenes = {
     this.renderForm(); window.scrollTo(0, 0);
   },
   async eliminar(id) {
+    if (!(await Tabs.labores.liberarOrden(id))) return;
     const o = Store.orden(id); if (!confirm(`¿Eliminar la orden N° ${otLabel(o)}? Se borran sus labores y salidas de stock.`)) return;
     await UI.run(async () => { for (const mv of S.movimientos_stock.filter(m => m.orden_id === id)) await DB.removeWhere('matches', { salida_mov_id: mv.id }); await DB.removeWhere('movimientos_stock', { orden_id: id }); await DB.remove('ordenes', id); await Store.loadCampania(S.campania.id); if (this.editId === id) this.limpiar(); App.render(); }, 'Orden eliminada');
   },
@@ -1223,7 +1227,7 @@ Tabs.labores = {
       <select style="width:auto" onchange="Tabs.labores.filtro.estado=this.value;App.render()">${opts(['todas', 'pendientes', 'facturadas'], f.estado)}</select>
       <select style="width:auto" onchange="Tabs.labores.filtro.campo=this.value;App.render()">${opts(S.campos, f.campo, c => c.nombre, c => c.id, 'Todos los campos')}</select></h2>
       <div class="tablewrap"><table class="t compact"><thead><tr><th>OT</th><th>Fecha</th><th>Campo · Lote</th><th>Tipo</th><th>Aplicador</th><th class="num">Has OT</th><th class="num">Has reales</th><th class="num">$/ha</th><th class="num">TC</th><th class="num">USD</th><th>Factura</th><th>Paga</th><th>Obs.</th><th></th></tr></thead><tbody>
-      ${rows.map(r => { const lb = r.lb; return `<tr id="lb-${lb.id}" style="${lb.factura ? '' : 'background:#fffdf7'}"><td><b>${otLabel(r.o)}</b></td><td><input type="date" style="width:130px" value="${lb.fecha || r.o.fecha || ''}" onchange="Tabs.labores.set('${lb.id}','fecha',this.value)"></td>
+      ${rows.map(r => { const lb = r.lb; const lock = this.fijada(lb); return `<tr id="lb-${lb.id}" class="${lock ? 'lb-lock' : ''}" ${lock ? `onclick="Tabs.labores.abrirDeLabor('${lb.id}')" title="Factura fijada: clic para abrirla"` : ''} style="${lock ? 'background:#f1f6f1' : lb.factura ? '' : 'background:#fffdf7'}"><td><b>${otLabel(r.o)}</b>${lock ? ' 🔒' : ''}</td><td><input type="date" style="width:130px" value="${lb.fecha || r.o.fecha || ''}" onchange="Tabs.labores.set('${lb.id}','fecha',this.value)"></td>
         <td class="nowrap">${esc(r.c.nombre)} · <b>L ${esc(r.l.nombre)}</b> ${r.c.participa && r.l.participa ? '' : '<span class="tag bad">no soc.</span>'}</td><td class="small">${esc(r.o.tipo_labor)}</td>
         <td><select onchange="Tabs.labores.contratista('${lb.id}',this)">${opts(S.contratistas, lb.contratista_id, c => c.nombre, c => c.id, '—')}<option value="__nuevo">+ Agregar contratista…</option></select></td>
         <td class="num">${fmt(r.ol.has, 1)}</td><td class="num"><input type="number" step="0.1" value="${lb.has_reales ?? r.ol.has}" onchange="Tabs.labores.set('${lb.id}','has_reales',num(this.value))"></td>
@@ -1233,26 +1237,56 @@ Tabs.labores = {
         <td><input type="text" style="width:110px" value="${esc(lb.factura || '')}" placeholder="N° factura" onchange="Tabs.labores.set('${lb.id}','factura',this.value)"></td>
         <td><select onchange="Tabs.labores.set('${lb.id}','aportante',this.value)">${optsAp(lb.aportante, '—')}</select></td>
         <td><input type="text" style="width:120px" value="${esc(lb.obs || '')}" onchange="Tabs.labores.set('${lb.id}','obs',this.value)"></td>
-        <td class="actions"><button class="btn xs" title="Copiar precio, TC, factura, aportante y aplicador a todos los lotes de la orden" onclick="Tabs.labores.aplicarOrden('${lb.id}')">→ toda la orden</button></td></tr>`; }).join('') || '<tr><td colspan="14" class="muted">No hay labores. Se generan automáticamente al crear órdenes de trabajo.</td></tr>'}
+        <td class="actions">${lock ? '<span class="muted small">fijada</span>' : `<button class="btn xs" title="Copiar precio, TC, factura, aportante y aplicador a todos los lotes de la orden" onclick="Tabs.labores.aplicarOrden('${lb.id}')">→ toda la orden</button>`}</td></tr>`; }).join('') || '<tr><td colspan="14" class="muted">No hay labores. Se generan automáticamente al crear órdenes de trabajo.</td></tr>'}
       </tbody><tfoot><tr><td colspan="6">Total</td><td class="num">${fmt(sum(rows, r => r.lb.has_reales ?? r.ol.has), 1)}</td><td></td><td></td><td class="num">${fmt(sum(rows, r => r.lb.monto_usd))}</td><td colspan="4"></td></tr></tfoot></table></div></div>`;
   },
   /* resumen tipo cuenta corriente: una fila por factura (aplicador + N° factura) */
+  facKey(lb) { return (lb.contratista_id || '') + '|' + String(lb.factura || '').trim(); },
+  facInfo(key) { return ((S.campania.proyeccion || {}).facturas || {})[key] || {}; },
+  fijada(lb) { return !!(lb && lb.factura && this.facInfo(this.facKey(lb)).fijada); },
+  ordenFijada(ordenId) { return S.labores.filter(l => l.orden_id === ordenId && this.fijada(l)); },
+  async facSave(key, patch) { const P = { ...(S.campania.proyeccion || {}) }; P.facturas = { ...(P.facturas || {}) }; P.facturas[key] = { ...(P.facturas[key] || {}), ...patch }; await Store.saveCampania({ proyeccion: P }); },
+  async facMonto(key, v) { await UI.run(async () => { await this.facSave(key, { monto: num(v) || null }); App.render(); }); },
+  async fijar(key, netoCalc) {
+    const info = this.facInfo(key); const m = num(info.monto); if (!m) return UI.toast('Primero cargá el monto de la factura', true);
+    const dif = m - netoCalc; const [, nro] = key.split('|');
+    if (Math.abs(dif) > 1 && !confirm(`El monto de la factura ${nro} ($ ${fmt(m)}) no coincide con el neto calculado de las labores ($ ${fmt(netoCalc)}). Diferencia: $ ${fmt(dif)}.\n\n¿Fijarla igual?`)) return;
+    if (!confirm(`¿Fijar la factura ${nro}? Las labores y las órdenes que incluye quedan con candado y no se van a poder editar hasta que la abras.`)) return;
+    await UI.run(async () => { await this.facSave(key, { fijada: true, fijada_por: Store.email(), fijada_el: new Date().toISOString() }); App.render(); }, `Factura ${nro} fijada`);
+  },
+  // devuelve true si quedó abierta (o si no estaba fijada)
+  async abrir(key, sinPreguntar) {
+    if (!this.facInfo(key).fijada) return true; const [, nro] = key.split('|');
+    if (!sinPreguntar && !confirm(`La factura ${nro} está fijada (con candado).\n\n¿Querés ABRIR la factura para poder editar?`)) return false;
+    await UI.run(async () => { await this.facSave(key, { fijada: false }); App.render(); }, `Factura ${nro} abierta`); return true;
+  },
+  async abrirDeLabor(id) { const lb = S.labores.find(x => x.id === id); if (lb) await this.abrir(this.facKey(lb)); },
+  // para editar/eliminar una OT: si tiene labores en facturas fijadas, pregunta si se abren
+  async liberarOrden(ordenId) {
+    const keys = [...new Set(this.ordenFijada(ordenId).map(l => this.facKey(l)))]; if (!keys.length) return true;
+    if (!confirm(`Esta orden está con candado porque sus labores están en factura(s) fijada(s): ${keys.map(k => k.split('|')[1]).join(', ')}.\n\n¿Querés ABRIR la(s) factura(s) para poder editarla?`)) return false;
+    for (const k of keys) await this.abrir(k, true); return true;
+  },
   renderCuentaCorriente() {
     const f = this.filtro; const all = this.rows();
     const aps = [...new Set(all.map(r => r.lb.contratista_id).filter(Boolean))].map(id => Store.contratista(id)).filter(Boolean).sort((a, b) => a.nombre.localeCompare(b.nombre));
     let rows = all; if (f.cc_ap) rows = rows.filter(r => r.lb.contratista_id === f.cc_ap);
     const g = {};
-    rows.filter(r => r.lb.factura).forEach(r => { const lb = r.lb; const k = (lb.contratista_id || '') + '|' + String(lb.factura).trim(); const x = g[k] = g[k] || { contratista: Store.contratista(lb.contratista_id) || {}, factura: String(lb.factura).trim(), fecha: null, ots: new Set(), campos: new Set(), has: 0, neto: 0, usd: 0, tcs: [], pagan: new Set() };
+    rows.filter(r => r.lb.factura).forEach(r => { const lb = r.lb; const k = (lb.contratista_id || '') + '|' + String(lb.factura).trim(); const x = g[k] = g[k] || { key: k, contratista: Store.contratista(lb.contratista_id) || {}, factura: String(lb.factura).trim(), fecha: null, ots: new Set(), campos: new Set(), has: 0, neto: 0, usd: 0, tcs: [], pagan: new Set() };
       const fe = lb.fecha || r.o.fecha; if (fe && (!x.fecha || fe < x.fecha)) x.fecha = fe; x.ots.add(otLabel(r.o)); x.campos.add(r.c.nombre); const has = num(lb.has_reales ?? r.ol.has); x.has += has; x.neto += has * num(lb.precio_ha_ars); x.usd += num(lb.monto_usd); if (num(lb.tc)) x.tcs.push(num(lb.tc)); if (lb.aportante) x.pagan.add(lb.aportante); });
     const facs = Object.values(g).sort((a, b) => (a.fecha || '').localeCompare(b.fecha || '') || a.factura.localeCompare(b.factura, undefined, { numeric: true }));
     const pend = rows.filter(r => !r.lb.factura); const pendHas = sum(pend, r => r.lb.has_reales ?? r.ol.has), pendUsd = sum(pend, r => r.lb.monto_usd);
     const pendPorAp = {}; pend.forEach(r => { const n = (Store.contratista(r.lb.contratista_id) || {}).nombre || 'SIN APLICADOR'; pendPorAp[n] = pendPorAp[n] || { has: 0, ots: new Set() }; pendPorAp[n].has += num(r.lb.has_reales ?? r.ol.has); pendPorAp[n].ots.add(otLabel(r.o)); });
     return `<div class="card"><h2>Cuenta corriente de aplicadores <span class="muted small">facturas cargadas</span><span class="spacer"></span>
       <select style="width:auto" onchange="Tabs.labores.filtro.cc_ap=this.value;App.render()">${opts(aps, f.cc_ap || '', c => c.nombre, c => c.id, 'Todos los aplicadores')}</select></h2>
-      <div class="tablewrap"><table class="t compact"><thead><tr><th>Fecha</th><th>Aplicador</th><th>Factura</th><th>OT</th><th>Campo</th><th class="num">Has</th><th class="num">$/ha</th><th class="num">Neto $</th><th class="num">TC</th><th class="num">USD</th><th>Paga</th></tr></thead><tbody>
-      ${facs.map(x => { const tc = x.tcs.length ? sum(x.tcs) / x.tcs.length : null; return `<tr><td class="nowrap">${fdate(x.fecha)}</td><td><b>${esc(x.contratista.nombre || '—')}</b></td><td><b>${esc(x.factura)}</b></td><td class="small">${[...x.ots].sort((a, b) => String(a).localeCompare(String(b), undefined, { numeric: true })).join(', ')}</td><td class="small">${[...x.campos].join(', ')}</td><td class="num">${fmt(x.has, 1)}</td><td class="num">${x.has ? fmt(x.neto / x.has, 2) : ''}</td><td class="num">${fmt(x.neto)}</td><td class="num">${tc ? fmt(tc, 2) : ''}</td><td class="num"><b>${fmt(x.usd)}</b></td><td>${[...x.pagan].map(tagAp).join(' ') || '<span class="tag bad">—</span>'}</td></tr>`; }).join('') || '<tr><td colspan="11" class="muted">Todavía no hay facturas cargadas.</td></tr>'}
-      </tbody><tfoot><tr><td colspan="5">Total facturado (${facs.length} factura${facs.length === 1 ? '' : 's'})</td><td class="num">${fmt(sum(facs, x => x.has), 1)}</td><td></td><td class="num">${fmt(sum(facs, x => x.neto))}</td><td></td><td class="num">${fmt(sum(facs, x => x.usd))}</td><td></td></tr>
-      <tr><td colspan="5" class="muted">Pendiente de facturar: ${Object.entries(pendPorAp).map(([n, v]) => `${esc(n)} ${fmt(v.has, 1)} ha (OT ${[...v.ots].sort((a, b) => String(a).localeCompare(String(b), undefined, { numeric: true })).join(', ')})`).join(' · ') || 'nada'}</td><td class="num muted">${fmt(pendHas, 1)}</td><td colspan="3"></td><td class="num muted">${pendUsd ? fmt(pendUsd) : ''}</td><td></td></tr></tfoot></table></div></div>`;
+      <div class="tablewrap"><table class="t compact"><thead><tr><th>Fecha</th><th>Aplicador</th><th>Factura</th><th>OT</th><th>Campo</th><th class="num">Has</th><th class="num">$/ha</th><th class="num">Neto $</th><th class="num">TC</th><th class="num">USD</th><th>Paga</th><th class="num">Monto factura $</th><th class="num">Dif. $</th><th></th></tr></thead><tbody>
+      ${facs.map(x => { const tc = x.tcs.length ? sum(x.tcs) / x.tcs.length : null; const fi = this.facInfo(x.key); const dif = num(fi.monto) ? num(fi.monto) - x.neto : null; return `<tr style="${fi.fijada ? 'background:#f1f6f1' : ''}"><td class="nowrap">${fdate(x.fecha)}</td><td><b>${esc(x.contratista.nombre || '—')}</b></td><td><b>${esc(x.factura)}</b></td><td class="small">${[...x.ots].sort((a, b) => String(a).localeCompare(String(b), undefined, { numeric: true })).join(', ')}</td><td class="small">${[...x.campos].join(', ')}</td><td class="num">${fmt(x.has, 1)}</td><td class="num">${x.has ? fmt(x.neto / x.has, 2) : ''}</td><td class="num">${fmt(x.neto)}</td><td class="num">${tc ? fmt(tc, 2) : ''}</td><td class="num"><b>${fmt(x.usd)}</b></td><td>${[...x.pagan].map(tagAp).join(' ') || '<span class="tag bad">—</span>'}</td>
+        <td class="num">${fi.fijada ? `<b>${fmt(fi.monto)}</b>` : `<input type="number" step="0.01" style="width:130px" value="${fi.monto ?? ''}" placeholder="${Math.round(x.neto)}" onchange="Tabs.labores.facMonto('${x.key}',this.value)">`}</td>
+        <td class="num ${dif !== null && Math.abs(dif) > 1 ? 'neg' : ''}">${dif === null ? '' : (Math.abs(dif) <= 1 ? '✓' : (dif > 0 ? '+' : '') + fmt(dif))}</td>
+        <td class="actions nowrap">${fi.fijada ? `<span title="Fijada${fi.fijada_por ? ' por ' + esc(fi.fijada_por) : ''}">🔒</span> <button class="btn xs" onclick="Tabs.labores.abrir('${x.key}')">Abrir</button>` : `<button class="btn xs primary" onclick="Tabs.labores.fijar('${x.key}',${x.neto})">Fijar 🔒</button>`}</td></tr>`; }).join('') || '<tr><td colspan="14" class="muted">Todavía no hay facturas cargadas.</td></tr>'}
+      </tbody><tfoot><tr><td colspan="5">Total facturado (${facs.length} factura${facs.length === 1 ? '' : 's'})</td><td class="num">${fmt(sum(facs, x => x.has), 1)}</td><td></td><td class="num">${fmt(sum(facs, x => x.neto))}</td><td></td><td class="num">${fmt(sum(facs, x => x.usd))}</td><td></td><td class="num">${fmt(sum(facs, x => this.facInfo(x.key).monto))}</td><td colspan="2"></td></tr>
+      <tr><td colspan="5" class="muted">Pendiente de facturar: ${Object.entries(pendPorAp).map(([n, v]) => `${esc(n)} ${fmt(v.has, 1)} ha (OT ${[...v.ots].sort((a, b) => String(a).localeCompare(String(b), undefined, { numeric: true })).join(', ')})`).join(' · ') || 'nada'}</td><td class="num muted">${fmt(pendHas, 1)}</td><td colspan="3"></td><td class="num muted">${pendUsd ? fmt(pendUsd) : ''}</td><td colspan="4"></td></tr></tfoot></table></div>
+      <p class="muted small" style="margin-top:6px">Cargá el <b>monto neto de la factura</b> para controlarlo contra lo calculado y apretá <b>Fijar</b>: las labores y las órdenes de esa factura quedan con candado. Para modificarlas hay que <b>Abrir</b> la factura.</p></div>`;
   },
   async contratista(id, sel) {
     if (sel.value !== '__nuevo') return this.set(id, 'contratista_id', sel.value);
@@ -1260,7 +1294,8 @@ Tabs.labores = {
     await UI.run(async () => { const c = await DB.insert('contratistas', { nombre: n.trim().toUpperCase(), activo: true }); S.contratistas.push(c); S.contratistas.sort((a, b) => a.nombre.localeCompare(b.nombre)); await this.set(id, 'contratista_id', c.id); }, 'Contratista agregado');
   },
   async set(id, f, v) {
-    const lb = S.labores.find(x => x.id === id); const patch = { [f]: v === '' ? null : v };
+    const lb = S.labores.find(x => x.id === id); if (this.fijada(lb)) { UI.toast('La factura está fijada: abrila para editar', true); App.render(); return; }
+    const patch = { [f]: v === '' ? null : v };
     if (f === 'fecha' && !lb.tc) { const tc = this.tcSugerido(v); if (tc) patch.tc = tc; }
     Object.assign(lb, patch);
     if (f !== 'monto_usd' && f !== 'factura' && f !== 'aportante' && f !== 'obs' && f !== 'contratista_id') {
@@ -1270,6 +1305,10 @@ Tabs.labores = {
   },
   async aplicarOrden(id) {
     const src = S.labores.find(x => x.id === id); const sib = S.labores.filter(x => x.orden_id === src.orden_id && x.id !== id);
+    if (!sib.length) return UI.toast('La orden tiene un solo lote');
+    if (sib.some(x => this.fijada(x))) return UI.toast('Hay lotes de esta orden en una factura fijada: abrila primero', true);
+    const o = Store.orden(src.orden_id) || {};
+    if (!confirm(`¿Estás seguro? Se van a copiar precio ($ ${fmt(src.precio_ha_ars, 2)}/ha), TC, factura (${src.factura || 'sin N°'}), aplicador y quién paga a los otros ${sib.length} lote(s) de la OT ${otLabel(o)}, pisando lo que tengan cargado.`)) return;
     await UI.run(async () => {
       for (const lb of sib) { const patch = { precio_ha_ars: src.precio_ha_ars, tc: src.tc, factura: src.factura, aportante: src.aportante, contratista_id: src.contratista_id, fecha: src.fecha }; if (num(src.precio_ha_ars) && num(src.tc)) patch.monto_usd = Math.round(num(lb.has_reales) * num(src.precio_ha_ars) / num(src.tc) * 100) / 100; Object.assign(lb, patch); await DB.update('labores', lb.id, patch); }
       App.render();
