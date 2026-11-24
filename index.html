@@ -1772,6 +1772,7 @@ Tabs.dashboard = {
       <div class="kpi"><div class="l">OT sin match / remitos s/precio</div><div class="v ${pendStock || pendPrecio ? 'neg' : 'pos'}">${pendStock} / ${pendPrecio}</div><div class="s">salidas de OT sin remito asignado · remitos sin precio (Stock)</div></div>
       ${P.filas.map(f => `<div class="kpi"><div class="l">Participación ${f.aportante}</div><div class="v">${pct(f.pct)}</div><div class="s">pactado ${pct(f.pct_pactada, 0)} · ${usd(f.total)}</div></div>`).join('')}
     </div>
+    ${this.renderSiembra()}
     <div class="grid2">
       <div class="card"><h2>Costos por rubro (USD)</h2><div class="chartbox"><canvas id="ch-rubros"></canvas></div></div>
       <div class="card"><h2>Costos por campo</h2><div class="chartbox"><canvas id="ch-campos"></canvas></div></div>
@@ -1785,12 +1786,43 @@ Tabs.dashboard = {
     // charts
     const colors = { alquiler: '#2f6b3a', insumos: '#2c5f8a', labores: '#b7791f', varios: '#7a6f9b', cosecha: '#8a4b2c' };
     const apColor = { PEGSA: '#2f6b3a', GYV: '#2c5f8a', MERZ: '#b7791f' };
-    const mk = (id, cfg) => { const el = document.getElementById(id); if (el && window.Chart) this.charts.push(new Chart(el, cfg)); };
+    const kfmt = v => Math.abs(v) >= 1000 ? fmt(v / 1000, Math.abs(v) >= 100000 ? 0 : 1) + 'k' : fmt(v, 0);
+    const numLabels = { id: 'numLabels', afterDatasetsDraw(ch) {
+      const ctx = ch.ctx, o = (ch.options.plugins.numLabels || {}), suf = o.suffix || ''; ctx.save(); ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      if (ch.config.type === 'doughnut') { const data = ch.data.datasets[0].data, tot = data.reduce((a, b) => a + b, 0) || 1;
+        ch.getDatasetMeta(0).data.forEach((arc, i) => { const v = data[i]; if (v / tot < 0.035) return; const a = (arc.startAngle + arc.endAngle) / 2, r = (arc.innerRadius + arc.outerRadius) / 2; const x = arc.x + Math.cos(a) * r, y = arc.y + Math.sin(a) * r; ctx.fillStyle = '#fff'; ctx.font = 'bold 11px sans-serif'; ctx.fillText(kfmt(v), x, y - 6); ctx.font = '10px sans-serif'; ctx.fillText(fmt(v / tot * 100, 0) + ' %', x, y + 7); }); }
+      else { const stacked = !!(ch.options.scales.x || {}).stacked; const totals = {};
+        ch.data.datasets.forEach((ds, di) => { const meta = ch.getDatasetMeta(di); if (meta.hidden) return; meta.data.forEach((bar, i) => { const v = num(ds.data[i]); if (!v) return;
+          if (stacked) { totals[i] = totals[i] || { v: 0, x: bar.x, y: bar.y }; totals[i].v += v; totals[i].y = Math.min(totals[i].y, bar.y); const h = Math.abs(bar.base - bar.y); if (h >= 15) { ctx.fillStyle = '#fff'; ctx.font = '10px sans-serif'; ctx.fillText(kfmt(v), bar.x, (bar.y + bar.base) / 2); } }
+          else { ctx.fillStyle = '#222'; ctx.font = 'bold 11px sans-serif'; ctx.fillText((o.full ? fmt(v, o.dec || 0) : kfmt(v)) + suf, bar.x, bar.y - 8); } }); });
+        if (stacked) Object.values(totals).forEach(t => { ctx.fillStyle = '#222'; ctx.font = 'bold 11px sans-serif'; ctx.fillText('US$ ' + fmt(t.v, 0), t.x, t.y - 8); }); }
+      ctx.restore(); } };
+    const mk = (id, cfg) => { const el = document.getElementById(id); if (!el || !window.Chart) return; cfg.plugins = [numLabels]; cfg.options = cfg.options || {}; cfg.options.layout = { padding: { top: 20 } }; this.charts.push(new Chart(el, cfg)); };
     mk('ch-rubros', { type: 'doughnut', data: { labels: rubros, datasets: [{ data: rubros.map(k => Math.round(tot[k])), backgroundColor: rubros.map(k => colors[k]) }] }, options: { maintainAspectRatio: false, plugins: { legend: { position: 'right' } } } });
     const campos = Calc.agrupar(part, r => r.campo.id, r => r.campo.nombre);
     mk('ch-campos', { type: 'bar', data: { labels: campos.map(c => c.label), datasets: rubros.map(k => ({ label: k, data: campos.map(c => Math.round(c[k])), backgroundColor: colors[k], stack: 's' })) }, options: { maintainAspectRatio: false, scales: { x: { stacked: true }, y: { stacked: true } } } });
-    mk('ch-proy', { type: 'bar', data: { labels: cult.map(x => x.c), datasets: [{ label: 'Proyectado', data: cult.map(x => Math.round(x.proyTot)), backgroundColor: '#c9d3c8' }, { label: 'Real', data: cult.map(x => Math.round(x.realTot)), backgroundColor: '#2f6b3a' }] }, options: { maintainAspectRatio: false } });
-    mk('ch-part', { type: 'bar', data: { labels: P.filas.map(f => f.aportante), datasets: [{ label: 'Pactado %', data: P.filas.map(f => +(f.pct_pactada * 100).toFixed(1)), backgroundColor: '#c9d3c8' }, { label: 'Real %', data: P.filas.map(f => +(f.pct * 100).toFixed(1)), backgroundColor: P.filas.map(f => apColor[f.aportante] || '#888') }] }, options: { maintainAspectRatio: false, scales: { y: { max: 100 } } } });
+    mk('ch-proy', { type: 'bar', data: { labels: cult.map(x => x.c), datasets: [{ label: 'Proyectado', data: cult.map(x => Math.round(x.proyTot)), backgroundColor: '#c9d3c8' }, { label: 'Real', data: cult.map(x => Math.round(x.realTot)), backgroundColor: '#2f6b3a' }] }, options: { maintainAspectRatio: false, plugins: { numLabels: { full: true } } } });
+    mk('ch-part', { type: 'bar', data: { labels: P.filas.map(f => f.aportante), datasets: [{ label: 'Pactado %', data: P.filas.map(f => +(f.pct_pactada * 100).toFixed(1)), backgroundColor: '#c9d3c8' }, { label: 'Real %', data: P.filas.map(f => +(f.pct * 100).toFixed(1)), backgroundColor: P.filas.map(f => apColor[f.aportante] || '#888') }] }, options: { maintainAspectRatio: false, plugins: { numLabels: { full: true, dec: 1, suffix: ' %' } }, scales: { y: { max: 100 } } } });
+  },
+  /* estado de siembra por campo y cultivo: OT de siembra cargada = en proceso; labor de siembra facturada = sembrado */
+  renderSiembra() {
+    const esSiembra = o => /SIEMBRA/i.test(o.tipo_labor || ''); const porLote = {};
+    S.ordenes.filter(esSiembra).forEach(o => S.orden_lotes.filter(x => x.orden_id === o.id).forEach(ol => { const lb = S.labores.find(l => l.orden_lote_id === ol.id) || {}; const x = porLote[ol.lote_id] = porLote[ol.lote_id] || { ot: 0, fac: 0, ots: new Set(), facs: new Set() }; const has = num(lb.has_reales ?? ol.has); x.ot += has; x.ots.add(otLabel(o)); if (lb.factura) { x.fac += has; x.facs.add(String(lb.factura)); } }));
+    const filas = [];
+    S.campos.forEach(c => { const lotes = Store.lotesDe(c.id); [...new Set(lotes.map(l => l.cultivo))].forEach(cult => { const ls = lotes.filter(l => l.cultivo === cult); const has = sum(ls, l => l.has); if (!has) return;
+      let ot = 0, fac = 0; const ots = new Set(), facs = new Set(); const det = ls.map(l => { const x = porLote[l.id] || { ot: 0, fac: 0, ots: new Set(), facs: new Set() }; const o1 = Math.min(num(l.has), x.ot), f1 = Math.min(num(l.has), x.fac); ot += o1; fac += f1; x.ots.forEach(v => ots.add(v)); x.facs.forEach(v => facs.add(v)); return { l, ot: o1, fac: f1 }; });
+      filas.push({ c, cult, has, ot, fac, ots, facs, det }); }); });
+    if (!filas.length) return '';
+    const est = f => f.fac >= f.has * 0.99 ? '<span class="tag ok">Sembrado 100 %</span>' : f.ot >= f.has * 0.99 ? '<span class="tag warn">En proceso · OT cargada, falta facturar</span>' : f.ot > 0 ? `<span class="tag warn">En proceso · ${pct(f.ot / f.has, 0)} con OT</span>` : '<span class="tag gray">Sin OT de siembra</span>';
+    const icon = d => d.fac >= d.l.has * 0.99 ? '✅' : d.ot > 0 ? '🟡' : '⚪';
+    const tot = { has: sum(filas, f => f.has), ot: sum(filas, f => f.ot), fac: sum(filas, f => f.fac) };
+    return `<div class="card"><h2>Estado de siembra por campo <span class="muted small">según órdenes de trabajo de siembra</span></h2>
+      <div class="tablewrap"><table class="t compact"><thead><tr><th>Campo</th><th>Cultivo</th><th class="num">Has</th><th class="num">Con OT de siembra</th><th class="num">Sembrado (facturado)</th><th>Estado</th><th style="min-width:160px">Avance</th><th>Lotes</th><th>OT · factura</th></tr></thead><tbody>
+      ${filas.map(f => `<tr><td><b>${esc(f.c.nombre)}</b>${f.c.participa ? '' : ' <span class="tag bad">no soc.</span>'}</td><td>${esc(f.cult || '—')}</td><td class="num">${fmt(f.has, 0)}</td><td class="num">${fmt(f.ot, 0)} <span class="muted small">${pct(f.ot / f.has, 0)}</span></td><td class="num"><b>${fmt(f.fac, 0)}</b> <span class="muted small">${pct(f.fac / f.has, 0)}</span></td><td>${est(f)}</td>
+        <td><div class="bar" style="position:relative"><i style="width:${Math.min(100, f.ot / f.has * 100)}%;background:#e3c27a;position:absolute;left:0;top:0;bottom:0"></i><i style="width:${Math.min(100, f.fac / f.has * 100)}%;position:absolute;left:0;top:0;bottom:0"></i></div></td>
+        <td class="small">${f.det.map(d => `${icon(d)} L ${esc(d.l.nombre)}`).join(' &nbsp;')}</td><td class="small">${[...f.ots].length ? 'OT ' + [...f.ots].join(', ') : '—'}${[...f.facs].length ? ' · fac. ' + [...f.facs].join(', ') : ''}</td></tr>`).join('')}
+      </tbody><tfoot><tr><td colspan="2">Total</td><td class="num">${fmt(tot.has, 0)}</td><td class="num">${fmt(tot.ot, 0)} <span class="muted small">${pct(tot.ot / tot.has, 0)}</span></td><td class="num">${fmt(tot.fac, 0)} <span class="muted small">${pct(tot.fac / tot.has, 0)}</span></td><td colspan="4"></td></tr></tfoot></table></div>
+      <p class="muted small" style="margin-top:6px">✅ sembrado (labor de siembra con factura) · 🟡 en proceso (OT de siembra cargada, sin factura) · ⚪ sin OT de siembra. En la barra, el tramo claro es lo que tiene OT y el oscuro lo ya facturado.</p></div>`;
   },
   proyForm() {
     const proy = S.campania.proyeccion || {}; const rubros = ['alquiler', 'insumos', 'labores', 'varios', 'cosecha'];
