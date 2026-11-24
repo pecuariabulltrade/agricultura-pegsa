@@ -1772,6 +1772,11 @@ Tabs.dashboard = {
       <div class="kpi"><div class="l">OT sin match / remitos s/precio</div><div class="v ${pendStock || pendPrecio ? 'neg' : 'pos'}">${pendStock} / ${pendPrecio}</div><div class="s">salidas de OT sin remito asignado · remitos sin precio (Stock)</div></div>
       ${P.filas.map(f => `<div class="kpi"><div class="l">Participación ${f.aportante}</div><div class="v">${pct(f.pct)}</div><div class="s">pactado ${pct(f.pct_pactada, 0)} · ${usd(f.total)}</div></div>`).join('')}
     </div>
+    ${(() => { const proyTotal = sum(cult, x => x.proyTot * x.has); if (!proyTotal) return ''; const filas = P.filas.filter(f => f.pct_pactada > 0 || f.total > 0).sort((a, b) => (a.aportante === 'PEGSA' ? -1 : b.aportante === 'PEGSA' ? 1 : 0));
+      return `<div class="card"><h2>Inversión comprometida por socio <span class="muted small">estimado del agrónomo × participación pactada</span></h2>
+      <div class="kpis">${filas.map(f => { const comp = proyTotal * f.pct_pactada, ap = f.total + f.cosecha, av = comp ? ap / comp : null; return `<div class="kpi"><div class="l">${esc(aportanteNombre(f.aportante))} · ${pct(f.pct_pactada, 0)}</div><div class="v">${usd(comp)}</div><div class="s">lleva puesto <b>${usd(ap)}</b> (${pct(av, 1)}) · falta ${usd(Math.max(0, comp - ap))}</div><div class="bar" style="margin-top:6px"><i class="${av > 1 ? 'over' : ''}" style="width:${Math.min(100, (av || 0) * 100)}%"></i></div></div>`; }).join('')}
+      <div class="kpi"><div class="l">Total estimado campaña</div><div class="v">${usd(proyTotal)}</div><div class="s">aportado entre todos ${usd(sum(filas, f => f.total + f.cosecha))} (${pct(sum(filas, f => f.total + f.cosecha) / proyTotal, 1)})</div></div></div>
+      <p class="muted small" style="margin-top:6px">Compromiso = proyección del agrónomo (USD/ha por cultivo × hectáreas) × % pactado. "Lleva puesto" = alquiler devengado + insumos + labores + costos varios + cosecha que ese socio aportó hasta hoy.</p></div>`; })()}
     ${this.renderSiembra()}
     <div class="grid2">
       <div class="card"><h2>Costos por rubro (USD)</h2><div class="chartbox"><canvas id="ch-rubros"></canvas></div></div>
